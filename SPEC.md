@@ -145,7 +145,7 @@ Languages with no ecosystem file (`sh`, `md`, `adoc`, `bs`) cannot have a `dep[l
 |-----------|----------|-------|
 | `._rs` / `.rs` | Rust | Native compile via `rustc`; Cargo used for dep resolution when `Cargo.toml` is present |
 | `._js` / `.js` | JavaScript | Embedded as C data segment in the unified binary |
- - `._ts` / `.ts` | TypeScript | Precompiled to JS at build time via `tsc`, JS embedded as C data segment; `node` used at runtime instead of `npx tsx` for performance |
+| `._ts` / `.ts` | TypeScript | Precompiled to JS at build time via `bun build` (preferred) or `npx tsc` (fallback), JS embedded as C data segment; `node` used at runtime instead of `npx tsx` for performance |
 | `._jsx` / `.jsx` | JSX | Embedded as C data segment |
 | `._tsx` / `.tsx` | TSX | Embedded as C data segment |
 | `._java` / `.java` | Java | Compiled to JAR via `javac`; JAR embedded as C data segment; JVM declared as a runtime dependency |

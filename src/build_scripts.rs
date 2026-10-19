@@ -827,7 +827,7 @@ script.push_str("fi\n\n");
         script.push_str("echo \"Lua: requires lua at runtime (interpreter not bundled)\"\n");
     }
     if has_ts {
-        script.push_str("echo \"TypeScript: requires node+npx at runtime (interpreter not bundled)\"\n");
+        script.push_str("echo \"TypeScript: requires node at runtime (interpreter not bundled, TS precompiled to JS)\"\n");
     }
     script.push_str(&format!("if [ -f {} ]; then\n", bin_name));
     script.push_str(&format!("    cp {} ../{} 2>/dev/null && echo \"Binary copied to project root\"\n", bin_name, bin_name));
