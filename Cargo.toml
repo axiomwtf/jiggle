@@ -1,0 +1,16 @@
+[package]
+name = "jglc"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tar = "0.4"
+xz2 = "0.1"
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+walkdir = "2"
+tempfile = "3"
+anyhow = "1"
+thiserror = "1"
