@@ -145,7 +145,7 @@ Languages with no ecosystem file (`sh`, `md`, `adoc`, `bs`) cannot have a `dep[l
 |-----------|----------|-------|
 | `._rs` / `.rs` | Rust | Native compile via `rustc`; Cargo used for dep resolution when `Cargo.toml` is present |
 | `._js` / `.js` | JavaScript | Embedded as C data segment in the unified binary |
-| `._ts` / `.ts` | TypeScript | Embedded as C data segment |
+ - `._ts` / `.ts` | TypeScript | Precompiled to JS at build time via `tsc`, JS embedded as C data segment; `node` used at runtime instead of `npx tsx` for performance |
 | `._jsx` / `.jsx` | JSX | Embedded as C data segment |
 | `._tsx` / `.tsx` | TSX | Embedded as C data segment |
 | `._java` / `.java` | Java | Compiled to JAR via `javac`; JAR embedded as C data segment; JVM declared as a runtime dependency |
@@ -235,6 +235,7 @@ The Jiggle compiler outputs `build.sh` (Unix) alongside the `.tar.xz`. Pass `--t
 - Extracts `project.tar.xz` into `jgl_build/`
 - Restores each language's dependencies from the generated dep files
 - Compiles all native languages (Rust, C, C++, Go, Zig, Nim, Fortran) into object files or archives
+- Precompiles TypeScript (`.ts`) to JavaScript (`.js`) via `bun build` (preferred) or `npx tsc` (fallback) for faster runtime execution, embeds the JS as C data segments
 - Embeds scripting languages (JS, TS, TSX, JSX, Python, Lua, Ruby, PHP, BrightScript, Shell) as C data segments compiled to `.o` files
 - Compiles JVM languages (Java, Kotlin, Scala) to JARs and embeds them as C data segments; the binary unpacks and launches them via the JVM at runtime (JVM declared as a runtime dependency). The JAR data is embedded in the binary — no separate JAR file is produced as output.
 - Compiles C# to a `.dll` and embeds it as a C data segment; the binary unpacks and launches it via the .NET runtime at runtime (.NET declared as a runtime dependency). The DLL data is embedded in the binary — no separate DLL file is produced as output.

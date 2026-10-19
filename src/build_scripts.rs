@@ -381,9 +381,28 @@ script.push_str("fi\n\n");
             script.push_str("fi\n\n");
         }
     }
-    
+
+    // Precompile TypeScript to JavaScript for faster runtime execution
+    // The TS source is transpiled to JS at build time so the FFI bridge
+    // can use `node` directly instead of `npx tsx` (which is slow)
+    let ts_files: Vec<&String> = files_by_lang.get("ts")
+        .map(|v| v.iter().collect())
+        .unwrap_or_default();
+    if !ts_files.is_empty() {
+        script.push_str("# Precompile TypeScript to JavaScript for faster runtime\n");
+        script.push_str("# Prefer bun for speed, fall back to npx tsc\n");
+        script.push_str("for tsf in *.ts; do\n");
+        script.push_str("    [ -f \"$tsf\" ] || continue\n");
+        script.push_str("    if command -v bun &> /dev/null; then\n");
+        script.push_str("        bun build \"$tsf\" --outdir /tmp/ts_out --format cjs 2>/dev/null && cp /tmp/ts_out/$(basename \"${tsf%.ts}\").js \"${tsf%.ts}.js\" 2>/dev/null || true\n");
+        script.push_str("    elif command -v npx &> /dev/null; then\n");
+        script.push_str("        npx --yes tsc --module commonjs --target es2020 --outDir /tmp/ts_out \"$tsf\" 2>/dev/null && cp /tmp/ts_out/$(basename \"$tsf\" .ts).js \"${tsf%.ts}.js\" 2>/dev/null || true\n");
+        script.push_str("    fi\n");
+        script.push_str("done\n\n");
+    }
+
     // Scripting languages and binary payloads - embed as C string data for unified binary
-    // JS, TS, TSX, JSX, Python, Lua, BrightScript, and binary payloads (JARs, DLLs)
+    // JS, TS, TSX, JSX, Python, Lua, BrightScript, and binary payloads (JARS, DLLs)
     // are all embedded as C data segments compiled to .o files and linked into the unified binary
     let script_langs = ["js", "ts", "tsx", "jsx", "py", "lua", "bs", "rb", "sh", "php"];
     let mut script_files: Vec<(&str, &String)> = Vec::new();
@@ -678,25 +697,28 @@ script.push_str("fi\n\n");
 
     if has_ts {
         script.push_str("# Generate FFI bridge for TypeScript\n");
-        script.push_str("# Node.js runtime is NOT bundled - declared as a runtime dependency\n");
+        script.push_str("# TypeScript was precompiled to JS at build time; use node directly\n");
         script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
         script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
         script.push_str("    echo '#include <stdio.h>' >> ffi_jgl_ts.c\n");
         script.push_str("    echo '#include <string.h>' >> ffi_jgl_ts.c\n");
         script.push_str("    echo '#include <stdint.h>' >> ffi_jgl_ts.c\n");
+        // Iterate .ts files, find their precompiled .js counterparts
         script.push_str("    for tsf in *.ts; do\n");
         script.push_str("        [ -f \"$tsf\" ] || continue\n");
-        script.push_str("        var_name=$(echo \"$tsf\" | tr '.' '_')\n");
+        script.push_str("        jsf=\"${tsf%.ts}.js\"\n");
+        script.push_str("        [ -f \"$jsf\" ] || continue\n");
+        script.push_str("        var_name=$(echo \"$jsf\" | tr '.' '_')\n");
         script.push_str("        echo \"extern const unsigned char ${var_name}_data[]; extern const uint32_t ${var_name}_len;\" >> ffi_jgl_ts.c\n");
         script.push_str("        methods=$(grep -oP '(?:export\\s+)?function\\s+\\w+\\s*\\(' \"$tsf\" | sed 's/.*function\\s\\+\\(\\w\\+\\)\\s*(/\\1/' || true)\n");
         script.push_str("        for method in $methods; do\n");
         script.push_str("            [ -n \"$method\" ] || continue\n");
         script.push_str("            cat >> ffi_jgl_ts.c << TS_FUNC\n");
         script.push_str("double ${method}(double a) {\n");
-        script.push_str("    FILE *tf = fopen(\"/tmp/_jgl_ts_${method}.ts\", \"w\");\n");
+        script.push_str("    FILE *tf = fopen(\"/tmp/_jgl_ts_${method}.js\", \"w\");\n");
         script.push_str("    if (tf) { fwrite(${var_name}_data, 1, ${var_name}_len, tf); fclose(tf); }\n");
         script.push_str("    char cmd[1024];\n");
-        script.push_str("    snprintf(cmd, sizeof(cmd), \"npx --yes tsx -e \\\"import('/tmp/_jgl_ts_${method}.ts').then(m => console.log(m.${method}(parseFloat(process.argv[1]))))\\\" %g 2>/dev/null\", a);\n");
+        script.push_str("    snprintf(cmd, sizeof(cmd), \"node -e \\\"const m = require('/tmp/_jgl_ts_${method}.js'); console.log(m.${method}(parseFloat(process.argv[1])))\\\" %g 2>/dev/null\", a);\n");
         script.push_str("    FILE *p = popen(cmd, \"r\");\n");
         script.push_str("    double result = 0.0;\n");
         script.push_str("    if (p) { fscanf(p, \"%lf\", &result); pclose(p); }\n");

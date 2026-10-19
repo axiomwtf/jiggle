@@ -78,7 +78,7 @@ Aliases: `build` for `compile`, `check` for `validate`, `gen` for `generate`. Ev
 | Special | BrightScript (Roku target only) |
 | Custom | Define your own in the manifest, see the spec |
 
-Runtimes that can't be statically linked (JVM, .NET) are declared as dependencies. The binary checks for them at startup and tells the user what to install. The output is still one file.
+ Runtimes that can't be statically linked (JVM, .NET, Python, Lua, Node.js) are declared as runtime dependencies. Language payloads (JARs, DLLs, scripts) are embedded as data segments within the single binary — the binary unpacks them to `/tmp/` at runtime and launches the interpreter. The output is still one file.
 
 ## Building from source
 
