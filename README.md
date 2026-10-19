@@ -8,7 +8,7 @@
 
 Jiggle (`.jgl`) is a polyglot bundle format and compiler system by [Axiom](https://github.com/axiomwtf). A single `project.jgl` file holds blocks written in different languages. `jglc` unpacks them into a virtual filesystem, bundles them as a `.tar.xz`, generates a `build.sh`, and compiles everything into one native binary.
 
-> **Status:** `0.2.0-draft`. The spec and the compiler are both early and will change.
+> **Status:** `0.2.0`.
 
 ## Why
 
