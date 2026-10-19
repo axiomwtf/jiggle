@@ -213,7 +213,6 @@ script.push_str("fi\n\n");
                 script.push_str(&format!("    echo \"Compiling Go: {}\"\n", f));
                 script.push_str(&format!("    go build -buildmode=c-archive -o {} {} 2>&1 || echo \"Warning: Go compilation failed for {}\"\n",
                     sh_quote(&a_name), sh_quote(f), sh_quote(f)));
-                script.push_str(&format!("    if [ -f {} ]; then NATIVE_OBJECTS=\"$NATIVE_OBJECTS {}\"; fi\n", sh_quote(&a_name), sh_quote(&a_name)));
             }
             script.push_str("else\n");
             script.push_str("    echo \"Warning: Go compiler (go) not found, skipping Go compilation\"\n");
@@ -495,7 +494,7 @@ script.push_str("fi\n\n");
         script.push_str("# Non-Rust project: link all native objects with clang/gcc\n");
         script.push_str("# Collect native object files\n");
         for obj in &native_objects {
-            script.push_str(&format!("if [ -f {} ]; then NATIVE_OBJECTS=\"$NATIVE_OBJECTS {}\"; fi\n", sh_quote(obj), sh_quote(obj)));
+            script.push_str(&format!("if [ -f {} ]; then NATIVE_OBJECTS=\"$NATIVE_OBJECTS {}\"; fi\n", obj, obj));
         }
         script.push_str("# Also collect embedded script objects\n");
         script.push_str("for embed in embed_*.o; do\n");
