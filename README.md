@@ -12,7 +12,7 @@ Jiggle (`.jgl`) is a polyglot bundle format and compiler system by [Axiom](https
 
 ## Why
 
-- **One output.** The result is always exactly one file: `jgl_binary` (or `jgl_binary.exe`). If `jglc` can't produce one binary, it fails with an error instead of producing partial output.
+ - **One output.** The result is always exactly one file: `jgl_binary` by default, or the project name declared in `project._jgl` if a `name` field is set (e.g. `name calc` produces `calc`). Pass `--target-win` for `jgl_binary.exe`. If `jglc` can't produce one binary, it fails with an error instead of producing partial output.
 - **No build files.** You never write a Makefile, CMake config, Gradle build or `package.json` scripts. Jiggle generates what it needs.
 - **Mix languages freely.** Use Rust for the engine, TypeScript for the UI, Lua for scripting and Markdown for docs, all in the same file.
 - **Declarative dependencies.** A `dep[lang]` block in the manifest is translated into each ecosystem's native file (`Cargo.toml`, `package.json`, `go.mod`, `requirements.txt` and more).
@@ -62,6 +62,8 @@ jglc compile --target-win     # cross-compile for Windows (jgl_binary.exe)
 jglc validate                 # parse and validate, no output
 jglc generate                 # generate bundle and build.sh without running it
 ```
+
+`build.sh --r` runs a release build (`-O3 -s`). By default `build.sh` builds in debug mode (`-O0 -g`). After building, `build.sh` copies the binary to the project root and cleans up the `jgl_build/` directory.
 
 Aliases: `build` for `compile`, `check` for `validate`, `gen` for `generate`. Every command takes `--project <file>` (default `project.jgl`), and `compile` and `generate` take `--output <dir>` (default `.`).
 

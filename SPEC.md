@@ -7,7 +7,7 @@
 
 Jiggle is a polyglot bundle format and compiler system. A single `project.jgl` file contains multiple language blocks which are unpacked into a virtual filesystem (VFS), bundled as a `.tar.xz`, and compiled into a single native binary. The compiler also auto-generates a `build.sh` build script.
 
-**The output is always, unconditionally, exactly one file: `jgl_binary` (or `jgl_binary.exe` on Windows).** No JARs. No DLLs. No sidecars. No "requires runtime" asterisks. Every language supported by Jiggle compiles down to a single binary. Runtimes that cannot be statically linked (JVM, Mono, CPython, etc.) are declared as system dependencies — the binary checks for them at startup and tells the user exactly what to install if they are missing, but the binary itself is still one file. If `jglc` cannot produce one binary, it fails with an error. It does not produce partial output.
+ **The output is always, unconditionally, exactly one file: `jgl_binary` by default, or the project name specified via `name` in `project._jgl` (e.g. `name calc` produces `calc`).** No JARs. No DLLs. No sidecars. No "requires runtime" asterisks. Every language supported by Jiggle compiles down to a single binary. Runtimes that cannot be statically linked (JVM, .NET, CPython, etc.) are declared as system dependencies — the binary checks for them at startup and tells the user exactly what to install if they are missing, but the binary itself is still one file. If `jglc` cannot produce one binary, it fails with an error. It does not produce partial output.
 
 ---
 
@@ -53,15 +53,18 @@ The manifest block uses the `._jgl` sigil. By convention it is named `project` t
 
 ```
 project._jgl {
+    name calc
+    target native
+
     import "auth.jgl"
-    target cross
 }
 ```
 
-**Manifest keywords:**
-- `import` — import and merge another `.jgl` file
-- `target` — compile target (`cross`, `native`, or a specific triple such as `x86_64-unknown-linux-gnu`)
-- `dep[lang] { ... }` — declare dependencies for a language, see section 3.5
+ **Manifest keywords:**
+ - `name` — sets the output binary name (e.g. `name calc` produces `calc` instead of `jgl_binary`). Defaults to `jgl_binary` if not specified.
+ - `import` — import and merge another `.jgl` file
+ - `target` — compile target (`cross`, `native`, or a specific triple such as `x86_64-unknown-linux-gnu`)
+ - `dep[lang] { ... }` — declare dependencies for a language, see section 3.5
 
 ### 3.4 Custom Languages
 
@@ -233,11 +236,11 @@ The Jiggle compiler outputs `build.sh` (Unix) alongside the `.tar.xz`. Pass `--t
 - Restores each language's dependencies from the generated dep files
 - Compiles all native languages (Rust, C, C++, Go, Zig, Nim, Fortran) into object files or archives
 - Embeds scripting languages (JS, TS, TSX, JSX, Python, Lua, Ruby, PHP, BrightScript, Shell) as C data segments compiled to `.o` files
-- Compiles JVM languages (Java, Kotlin, Scala) to JARs and embeds them as C data segments; the binary unpacks and launches them via the JVM at runtime (JVM declared as a runtime dependency)
-- Compiles C# to a `.dll` and embeds it as a C data segment; the binary unpacks and launches it via the .NET runtime at runtime (.NET declared as a runtime dependency)
-- Links everything into a single `jgl_binary` (or `jgl_binary.exe`)
+- Compiles JVM languages (Java, Kotlin, Scala) to JARs and embeds them as C data segments; the binary unpacks and launches them via the JVM at runtime (JVM declared as a runtime dependency). The JAR data is embedded in the binary — no separate JAR file is produced as output.
+- Compiles C# to a `.dll` and embeds it as a C data segment; the binary unpacks and launches it via the .NET runtime at runtime (.NET declared as a runtime dependency). The DLL data is embedded in the binary — no separate DLL file is produced as output.
+- Links everything into a single binary. The binary is named from the `name` field in `project._jgl` (defaults to `jgl_binary`). Pass `--r` to `build.sh` for a release build (`-O3 -s`); the default is debug (`-O0 -g`). After linking, the binary is copied to the project root and `jgl_build/` is cleaned up.
 
-**The output is always one file.** Regardless of which languages are used, the final product is a single binary. Language payloads (JARs, DLLs, scripts) are embedded as data segments. Runtimes that cannot be statically linked are declared as runtime dependencies — the binary checks for them at startup and tells the user what to install if they are missing.
+**The output is always one file.** Regardless of which languages are used, the final product is a single binary. Language payloads (JARs, DLLs, scripts) are embedded as data segments within the single binary. Runtimes that cannot be statically linked (JVM, .NET, Python, Lua, Node.js) are declared as runtime dependencies — the binary checks for them at startup and tells the user what to install if they are missing.
 
 When Rust is present it acts as the linker: all other native objects and embedded script objects are passed as link arguments to `rustc`. When Rust is absent, `clang` or `gcc` handles final linking.
 
@@ -266,6 +269,8 @@ jglc gen      (alias for generate)
 - `generate` — generate the bundle and `build.sh` without running it
 
 Default project file: `project.jgl`. Default output directory: `.`.
+
+Run `build.sh --r` for a release-optimized build (`-O3 -s`). Without `--r`, `build.sh` builds in debug mode (`-O0 -g`). In both cases, the binary is copied to the project root and `jgl_build/` is cleaned up.
 
 ---
 

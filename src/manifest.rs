@@ -33,6 +33,8 @@ pub struct Manifest {
     pub custom_languages: Vec<CustomLanguage>,
     /// Dependencies per language: dep[lang] { name = "version" }
     pub dependencies: HashMap<String, Vec<DependencyEntry>>,
+    /// Project/binary name (defaults to "jgl_binary" if not specified)
+    pub name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +50,7 @@ impl Default for Manifest {
             imports: Vec::new(),
             custom_languages: Vec::new(),
             dependencies: HashMap::new(),
+            name: String::new(),
         }
     }
 }
@@ -82,6 +85,13 @@ impl Manifest {
                 i += 1;
                 continue;
             }
+            // Parse name (keyword followed by space)
+            if line.starts_with("name ") {
+                let name = line.strip_prefix("name").unwrap().trim();
+                manifest.name = name.to_string();
+                i += 1;
+                continue;
+            }
             // Parse custom language block: <extension>._sh {
             // Match lines like "vmx._sh {" — extract the extension before "._sh"
             if let Some(ext) = line.strip_suffix("._sh {") {
@@ -95,6 +105,7 @@ impl Manifest {
                     continue;
                 }
             }
+
 
             // Parse dependency block: dep[lang] {
             if line.starts_with("dep[") && line.ends_with('{') {

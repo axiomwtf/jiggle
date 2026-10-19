@@ -107,11 +107,12 @@ pub fn build_vfs(
 
         // Generate lint suppressors (per spec, section 5)
         let mut content = generate_lint_suppressor(&language);
-        if !block.body.is_empty() {
+        let body = dedent(&block.body);
+        if !body.is_empty() {
             if !content.is_empty() {
                 content.push('\n');
             }
-            content.push_str(&block.body);
+            content.push_str(&body);
         }
 
         let entry = VfsEntry {
@@ -156,4 +157,38 @@ fn generate_lint_suppressor(lang: &str) -> String {
         _ => "",
     }
     .to_string()
+}
+/// Strip common leading whitespace from each line of a string.
+/// This handles blocks indented inside `.jgl` braces so that indentation-sensitive
+/// languages like Nim, Python, YAML, etc. parse correctly.
+fn dedent(body: &str) -> String {
+    // Trim leading/trailing blank lines, then find common indentation
+    let lines: Vec<&str> = body.lines().collect();
+
+    // Find first non-empty line to determine the indentation to strip
+    let first_non_empty = lines.iter().position(|l| !l.trim().is_empty());
+    let first_idx = match first_non_empty {
+        Some(idx) => idx,
+        None => return body.trim().to_string(),
+    };
+
+    // Calculate common leading whitespace from all non-empty lines
+    let first_indent = lines[first_idx].chars().take_while(|c| *c == ' ' || *c == '\t').count();
+    let common_indent = lines.iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.chars().take_while(|c| *c == ' ' || *c == '\t').count())
+        .min()
+        .unwrap_or(0)
+        .min(first_indent);
+
+    // Strip the common indentation from each line
+    let result: String = lines.iter().map(|l| {
+        if l.len() >= common_indent {
+            &l[common_indent..]
+        } else {
+            l.trim_start()
+        }
+    }).collect::<Vec<&str>>().join("\n");
+
+    result.trim().to_string()
 }
