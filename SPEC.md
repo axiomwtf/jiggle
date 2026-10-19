@@ -175,7 +175,6 @@ The Jiggle compiler automatically injects style/lint suppressors per language so
 | Language | Injected Suppressor |
 |----------|-------------------|
 | Rust | `#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]` |
-  <p class="body">The current build script compiles or embeds the languages below into the single binary.</p>
 | Kotlin | `@Suppress("all")` |
 | C# | `#pragma warning disable` |
 | JavaScript | `/* eslint-disable */` |
