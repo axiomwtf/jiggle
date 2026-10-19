@@ -1,5 +1,5 @@
 # Jiggle Language Specification
-**Version:** 0.2.0
+**Version:** 0.2.1
 **Ownership:** Jiggle is owned by AXIOM ![Axiom Logo](./axiom.svg)
 ---
 

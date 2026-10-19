@@ -443,30 +443,6 @@ script.push_str("fi\n\n");
         script.push_str("fi\n\n");
     }
     
-    // Embed binary payloads (JARs, DLLs) as C data segments
-    // JVM and .NET are NOT bundled - declared as runtime dependencies
-    // Only compiled artifacts are embedded as data
-    script.push_str("# Embed binary payloads (JARs, DLLs) as C data segments\n");
-    script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
-    script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
-    script.push_str("    for jar_file in *.jar *.dll; do\n");
-    script.push_str("        if [ -f \"$jar_file\" ]; then\n");
-    script.push_str("            var_name=$(echo \"$jar_file\" | tr '.' '_' | tr '-' '_')\n");
-    script.push_str("            obj_name=\"embed_${var_name}.o\"\n");
-    script.push_str("            echo \"Embedding $jar_file as C data...\"\n");
-    script.push_str("            echo \"#include <stdint.h>\" > \"embed_${var_name}.c\"\n");
-    script.push_str("            echo \"const char ${var_name}_name[] = \\\"$jar_file\\\";\" >> \"embed_${var_name}.c\"\n");
-    script.push_str("            printf \"const unsigned char ${var_name}_data[] = { \" >> \"embed_${var_name}.c\"\n");
-            script.push_str("            od -An -v -tx1 \"$jar_file\" | tr -d ' \\n' | sed 's/../0x&,/g; s/,$//' >> \"embed_${var_name}.c\"\n");
-    script.push_str("            echo \" };\" >> \"embed_${var_name}.c\"\n");
-    script.push_str("            printf \"const uint32_t ${var_name}_len = %d;\" $(wc -c < \"$jar_file\") >> \"embed_${var_name}.c\"\n");
-    script.push_str("            $SCRIPT_CC -c -O2 -o \"$obj_name\" \"embed_${var_name}.c\" 2>/dev/null || echo \"Warning: Failed to embed $jar_file\"\n");
-    script.push_str("            if [ -f \"$obj_name\" ]; then\n");
-    script.push_str("                NATIVE_OBJECTS=\"$NATIVE_OBJECTS $obj_name\"\n");
-    script.push_str("            fi\n");
-    script.push_str("        fi\n");
-    script.push_str("    done\n");
-    script.push_str("fi\n\n");
     // Generate FFI bridges for JVM and .NET languages
     // C code declares extern functions (e.g. extern double java_mod(...)) that correspond
     // to Java/C# static methods. We generate C wrapper stubs that call the runtime via subprocess.
@@ -754,6 +730,30 @@ script.push_str("fi\n\n");
             script.push_str("\n");
         }
     }
+    // Embed binary payloads (JARs, DLLs) as C data segments
+    // Must come AFTER FFI bridge generation (which adds JglJavaBridge to JAR
+    // and builds C# runner DLL) so the embedded data includes those additions
+    script.push_str("# Embed binary payloads (JARs, DLLs) as C data segments\n");
+    script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+    script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+    script.push_str("    for jar_file in *.jar *.dll; do\n");
+    script.push_str("        if [ -f \"$jar_file\" ]; then\n");
+    script.push_str("            var_name=$(echo \"$jar_file\" | tr '.' '_' | tr '-' '_')\n");
+    script.push_str("            obj_name=\"embed_${var_name}.o\"\n");
+    script.push_str("            echo \"Embedding $jar_file as C data...\"\n");
+    script.push_str("            echo \"#include <stdint.h>\" > \"embed_${var_name}.c\"\n");
+    script.push_str("            echo \"const char ${var_name}_name[] = \\\"$jar_file\\\";\" >> \"embed_${var_name}.c\"\n");
+    script.push_str("            printf \"const unsigned char ${var_name}_data[] = { \" >> \"embed_${var_name}.c\"\n");
+            script.push_str("            od -An -v -tx1 \"$jar_file\" | tr -d ' \\n' | sed 's/../0x&,/g; s/,$//' >> \"embed_${var_name}.c\"\n");
+    script.push_str("            echo \" };\" >> \"embed_${var_name}.c\"\n");
+    script.push_str("            printf \"const uint32_t ${var_name}_len = %d;\" $(wc -c < \"$jar_file\") >> \"embed_${var_name}.c\"\n");
+    script.push_str("            $SCRIPT_CC -c -O2 -o \"$obj_name\" \"embed_${var_name}.c\" 2>/dev/null || echo \"Warning: Failed to embed $jar_file\"\n");
+    script.push_str("            if [ -f \"$obj_name\" ]; then\n");
+    script.push_str("                NATIVE_OBJECTS=\"$NATIVE_OBJECTS $obj_name\"\n");
+    script.push_str("            fi\n");
+    script.push_str("        fi\n");
+    script.push_str("    done\n");
+    script.push_str("fi\n\n");
     
     // Link native object files into final binary
     // When Rust provides the main entry point, rustc links everything into jgl_binary.
