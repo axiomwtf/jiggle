@@ -36,6 +36,19 @@ pub fn generate_build_sh(
     script.push_str("else\n");
     script.push_str("    RELEASE_FLAGS=\"-O0 -g\"\n");
     script.push_str("fi\n\n");
+    // Windows cross-compilation environment
+    if target_win {
+        script.push_str("# Windows cross-compilation\n");
+        script.push_str("export CC_x86_64_unknown_windows_gnu=x86_64-w64-mingw32-gcc\n");
+        script.push_str("export CXX_x86_64_unknown_windows_gnu=x86_64-w64-mingw32-g++\n");
+        script.push_str("export WIN_CC=\"x86_64-w64-mingw32-gcc\"\n");
+        script.push_str("export WIN_CXX=\"x86_64-w64-mingw32-g++\"\n");
+        script.push_str("export WIN_AR=\"x86_64-w64-mingw32-ar\"\n");
+        script.push_str("export GOOS=windows\n");
+        script.push_str("export GOARCH=amd64\n");
+        script.push_str("export CGO_ENABLED=0\n");
+        script.push_str("export ZIG_TARGET=\"x86_64-windows-gnu\"\n\n");
+    }
     // Use the directory of the script itself as the base
     script.push_str("SCRIPT_DIR=$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\n");
     script.push_str("cd \"$SCRIPT_DIR\"\n\n");
@@ -161,8 +174,9 @@ script.push_str("fi\n\n");
                     script.push_str(&format!("    echo \"Compiling Rust: {}\"\n", f));
                     // Fix #[no_mangle] -> #[unsafe(no_mangle)] for rustc 1.82+
                     script.push_str(&format!("    sed 's/#\\[no_mangle\\]/#[unsafe(no_mangle)]/g' {} > _{}_fixed.rs\n", sh_quote(f), f.replace(".rs", "")));
-                    script.push_str(&format!("    rustc --edition 2024 -O --crate-type=lib --emit=obj -o {} _{}_fixed.rs 2>&1 || echo \"Warning: Rust compilation failed for {}\"\n",
-                        sh_quote(&out_name), f.replace(".rs", ""), sh_quote(f)));
+                    let rustc_win_target = if target_win { " --target=x86_64-pc-windows-gnu" } else { "" };
+                    script.push_str(&format!("    rustc --edition 2024 -O --crate-type=lib --emit=obj -o {} _{}_fixed.rs{} 2>&1 || echo \"Warning: Rust compilation failed for {}\"\n",
+                        sh_quote(&out_name), f.replace(".rs", ""), rustc_win_target, sh_quote(f)));
             }
             script.push_str("else\n");
                 script.push_str("    echo \"Warning: Rust compiler (rustc) not found, skipping Rust compilation\"\n");
@@ -180,8 +194,9 @@ script.push_str("fi\n\n");
                 let a_name = f.replace(".go", &format!("_{}.a", i));
                 // Use the .a archive directly as linker input (contains Go runtime + cgo)
                 script.push_str(&format!("    echo \"Compiling Go: {}\"\n", f));
-                script.push_str(&format!("    go build -buildmode=c-archive -o {} {} 2>&1 || echo \"Warning: Go compilation failed for {}\"\n",
-                    sh_quote(&a_name), sh_quote(f), sh_quote(f)));
+                let go_target = if target_win { "GOOS=windows GOARCH=amd64 CGO_ENABLED=0" } else { "" };
+                script.push_str(&format!("    {} go build -buildmode=c-archive -o {} {} 2>&1 || echo \"Warning: Go compilation failed for {}\"\n",
+                    go_target, sh_quote(&a_name), sh_quote(f), sh_quote(f)));
             }
             script.push_str("else\n");
             script.push_str("    echo \"Warning: Go compiler (go) not found, skipping Go compilation\"\n");
@@ -192,14 +207,23 @@ script.push_str("fi\n\n");
     // C compilation
     if let Some(c_files) = files_by_lang.get("c") {
         if !c_files.is_empty() {
-            script.push_str("# C\n");
-            script.push_str("if command -v clang &> /dev/null; then\n");
-            script.push_str("    CC=clang\n");
-            script.push_str("elif command -v gcc &> /dev/null; then\n");
-            script.push_str("    CC=gcc\n");
-            script.push_str("else\n");
-            script.push_str("    echo \"Warning: No C compiler found (clang or gcc), skipping C compilation\"\n");
-            script.push_str("fi\n");
+            if target_win {
+                script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then\n");
+                script.push_str("        CC=x86_64-w64-mingw32-gcc\n");
+                script.push_str("    elif command -v clang &> /dev/null; then\n");
+                script.push_str("        CC=\"clang --target=x86_64-pc-windows-gnu\"\n");
+                script.push_str("    else\n");
+                script.push_str("        echo \"Warning: No Windows C compiler found (mingw-w64 or clang), skipping C compilation\"\n");
+                script.push_str("    fi\n");
+            } else {
+                script.push_str("    if command -v clang &> /dev/null; then\n");
+                script.push_str("        CC=clang\n");
+                script.push_str("    elif command -v gcc &> /dev/null; then\n");
+                script.push_str("        CC=gcc\n");
+                script.push_str("    else\n");
+                script.push_str("        echo \"Warning: No C compiler found (clang or gcc), skipping C compilation\"\n");
+                script.push_str("    fi\n");
+            }
             for f in c_files {
                 let out_name = f.replace(".c", ".o");
                 object_files.push(out_name.clone());
@@ -215,13 +239,23 @@ script.push_str("fi\n\n");
         if !cpp_files.is_empty() {
             script.push_str("# C++\n");
             script.push_str("# Note: C++ functions must be wrapped in extern \"C\" for cross-language FFI\n");
-            script.push_str("if command -v clang++ &> /dev/null; then\n");
-            script.push_str("    CXX=clang++\n");
-            script.push_str("elif command -v g++ &> /dev/null; then\n");
-            script.push_str("    CXX=g++\n");
-            script.push_str("else\n");
-            script.push_str("    echo \"Warning: No C++ compiler found (clang++ or g++), skipping C++ compilation\"\n");
-            script.push_str("fi\n");
+            if target_win {
+                script.push_str("    if command -v x86_64-w64-mingw32-g++ &> /dev/null; then\n");
+                script.push_str("        CXX=x86_64-w64-mingw32-g++\n");
+                script.push_str("    elif command -v clang++ &> /dev/null; then\n");
+                script.push_str("        CXX=\"clang++ --target=x86_64-pc-windows-gnu\"\n");
+                script.push_str("    else\n");
+                script.push_str("        echo \"Warning: No Windows C++ compiler found (mingw-w64 or clang++), skipping C++ compilation\"\n");
+                script.push_str("    fi\n");
+            } else {
+                script.push_str("    if command -v clang++ &> /dev/null; then\n");
+                script.push_str("        CXX=clang++\n");
+                script.push_str("    elif command -v g++ &> /dev/null; then\n");
+                script.push_str("        CXX=g++\n");
+                script.push_str("    else\n");
+                script.push_str("        echo \"Warning: No C++ compiler found (clang++ or g++), skipping C++ compilation\"\n");
+                script.push_str("    fi\n");
+            }
             for f in cpp_files {
                 let out_name = f.replace(".cpp", ".o");
                 object_files.push(out_name.clone());
@@ -797,22 +831,37 @@ script.push_str("fi\n\n");
         script.push_str("for go_a in *_0.a; do\n");
         script.push_str("    if [ -f \"$go_a\" ]; then NATIVE_OBJECTS=\"$NATIVE_OBJECTS $go_a\"; fi\n");
         script.push_str("done\n");
-        script.push_str("\nif [ -n \"$NATIVE_OBJECTS\" ]; then\n");
-        script.push_str("    if command -v clang &> /dev/null; then\n");
-        script.push_str("        LINKER=clang\n");
-        script.push_str("    elif command -v gcc &> /dev/null; then\n");
-        script.push_str("        LINKER=gcc\n");
-        script.push_str("    else\n");
-        script.push_str("        echo \"Warning: No linker found (clang/gcc), skipping final link\"\n");
-        script.push_str("        LINKER=\"\"\n");
-        script.push_str("    fi\n");
-        script.push_str("    \n");
-        let bin_name_rs = if target_win { format!("{}.exe", bin_name) } else { bin_name.to_string() };
-        script.push_str("    if [ -n \"${LINKER:-}\" ]; then\n");
-        script.push_str(&format!("        $LINKER $RELEASE_FLAGS -o {} $NATIVE_OBJECTS -lm -lpthread -ldl\n", bin_name_rs));
-        script.push_str(&format!("        echo \"Linked unified native binary: {}\"\n", bin_name_rs));
-        script.push_str("    fi\n");
-        script.push_str("fi\n");
+        if target_win {
+            script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then\n");
+            script.push_str("        LINKER=x86_64-w64-mingw32-gcc\n");
+            script.push_str("    elif command -v x86_64-w64-mingw32-ld &> /dev/null; then\n");
+            script.push_str("        LINKER=x86_64-w64-mingw32-ld\n");
+            script.push_str("    else\n");
+            script.push_str("        echo \"Warning: No Windows linker found (mingw-w64), skipping final link\"\n");
+            script.push_str("        LINKER=\"\"\n");
+            script.push_str("    fi\n");
+            script.push_str("    \n");
+            let bin_name_rs = if target_win { format!("{}.exe", bin_name) } else { bin_name.to_string() };
+            script.push_str("    if [ -n \"${LINKER:-}\" ]; then\n");
+            script.push_str(&format!("        $LINKER $RELEASE_FLAGS -o {} $NATIVE_OBJECTS -lm -lwinpthread -lmsvcrt\n", bin_name_rs));
+            script.push_str(&format!("        echo \"Linked unified native binary: {}\"\n", bin_name_rs));
+            script.push_str("    fi\n");
+        } else {
+            script.push_str("    if command -v clang &> /dev/null; then\n");
+            script.push_str("        LINKER=clang\n");
+            script.push_str("    elif command -v gcc &> /dev/null; then\n");
+            script.push_str("        LINKER=gcc\n");
+            script.push_str("    else\n");
+            script.push_str("        echo \"Warning: No linker found (clang/gcc), skipping final link\"\n");
+            script.push_str("        LINKER=\"\"\n");
+            script.push_str("    fi\n");
+            script.push_str("    \n");
+            let bin_name_rs = if target_win { format!("{}.exe", bin_name) } else { bin_name.to_string() };
+            script.push_str("    if [ -n \"${LINKER:-}\" ]; then\n");
+            script.push_str(&format!("        $LINKER $RELEASE_FLAGS -o {} $NATIVE_OBJECTS -lm -lpthread -ldl\n", bin_name_rs));
+            script.push_str(&format!("        echo \"Linked unified native binary: {}\"\n", bin_name_rs));
+            script.push_str("    fi\n");
+        }
     }
     
     // Report embedded JVM/.NET dependencies
@@ -838,14 +887,14 @@ script.push_str("fi\n\n");
     if has_ts {
         script.push_str("echo \"TypeScript: requires node at runtime (interpreter not bundled, TS precompiled to JS)\"\n");
     }
-    script.push_str(&format!("if [ -f {} ]; then\n", bin_name));
-    script.push_str(&format!("    cp {} ../{} 2>/dev/null && echo \"Binary copied to project root\"\n", bin_name, bin_name));
+    let bin_name_final = if target_win { format!("{}.exe", bin_name) } else { bin_name.to_string() };
+    script.push_str(&format!("if [ -f {} ]; then\n", bin_name_final));
+    script.push_str(&format!("    cp {} ../{} 2>/dev/null && echo \"Binary copied to project root\"\n", bin_name_final, bin_name_final));
     script.push_str("    cd .. && rm -rf jgl_build && echo \"Cleaned up jgl_build/\"\n");
+    script.push_str(&format!("    echo \"Compilation complete.\"\n"));
     script.push_str("else\n");
-    script.push_str(&format!("    echo \"Warning: {} not found in jgl_build/\"\n", bin_name));
+    script.push_str(&format!("    echo \"Warning: {} not found in jgl_build/\"\n", bin_name_final));
     script.push_str("fi\n");
-    script.push_str("\ncd ..\n");
-    script.push_str("echo \"Compilation complete.\"\n");
     
     let build_sh_path = output_dir.join("build.sh");
     std::fs::write(&build_sh_path, script).map_err(|e| JglcError::Io(e))?;
