@@ -72,20 +72,19 @@ Aliases: `build` for `compile`, `check` for `validate`, `gen` for `generate`. Ev
 | Kind | Languages |
 |------|-----------|
 | Compiled and linked natively | Rust, C, C++, Go, Zig, Nim, Fortran |
-| Embedded as data in the binary | JavaScript, TypeScript, JSX, TSX, Python, Lua, Ruby, PHP, Shell |
+| Embedded as data in the binary | JavaScript, TypeScript\* (precompiled to JS at build time), JSX, TSX, Python, Lua, Ruby, PHP, Shell |
 | Embedded, needs a runtime | Java, Kotlin, Scala (JVM), C# (.NET) |
 | Static data | Markdown, AsciiDoc |
 | Special | BrightScript (Roku target only) |
 | Custom | Define your own in the manifest, see the spec |
 
- Runtimes that can't be statically linked (JVM, .NET, Python, Lua, Node.js) are declared as runtime dependencies. Language payloads (JARs, DLLs, scripts) are embedded as data segments within the single binary — the binary unpacks them to `/tmp/` at runtime and launches the interpreter. The output is still one file.
+<small>\* TypeScript is precompiled to JavaScript at build time (preferred: `bun build`, fallback: `npx tsc`), then embedded as data. At runtime, `node` is used to execute the precompiled JS.</small>
 
 ## Building from source
 
 The compiler is written in Rust (edition 2024) and lives in [`src/`](./src).
 
 ```bash
-cd jglc
 cargo build --release
 ```
 
