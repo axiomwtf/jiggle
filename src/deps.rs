@@ -1,6 +1,7 @@
 use crate::error::JglcError;
 use crate::manifest::{Manifest, DependencyEntry, CustomLanguage};
 use crate::vfs::Vfs;
+use std::collections::HashMap;
 
 /// Generate native dependency files and add them to the VFS
 pub fn generate_dependency_files(
@@ -19,9 +20,25 @@ pub fn generate_dependency_files(
     }
 
     // Generate dep files for each language
+    // Languages that share the same dependency file (e.g. js/ts/tsx/jsx -> package.json,
+    // java/kt/scala -> pom.xml, c/cpp -> vcpkg.json) are merged into a single file
+    // to avoid collisions
+    let mut files_by_output: HashMap<String, Vec<DependencyEntry>> = HashMap::new();
+    let mut lang_per_output: HashMap<String, String> = HashMap::new();
     for (lang, entries) in &manifest.dependencies {
-        let dep_file_content = generate_dep_file(lang, entries, custom_languages)?;
         let dep_filename = get_dep_filename(lang, custom_languages)?;
+        let existing = files_by_output.entry(dep_filename.clone()).or_insert_with(Vec::new);
+        for entry in entries {
+            // Avoid duplicate entries (same name)
+            if !existing.iter().any(|e: &DependencyEntry| e.name == entry.name) {
+                existing.push(entry.clone());
+            }
+        }
+        lang_per_output.entry(dep_filename).or_insert_with(|| lang.clone());
+    }
+    for (dep_filename, entries) in &files_by_output {
+        let lang = lang_per_output.get(dep_filename).unwrap();
+        let dep_file_content = generate_dep_file(lang, entries, custom_languages)?;
 
         // Check for collision with existing VFS file
         if vfs.contains(&dep_filename) {
@@ -40,7 +57,7 @@ pub fn generate_dependency_files(
             is_data: false,
         };
 
-        vfs.add_file(dep_filename, entry)?;
+        vfs.add_file(dep_filename.clone(), entry)?;
     }
 
     Ok(())
@@ -219,8 +236,8 @@ fn generate_requirements_txt(entries: &[DependencyEntry]) -> Result<String, Jglc
 fn generate_pom_xml(entries: &[DependencyEntry]) -> Result<String, JglcError> {
     let mut content = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-        <project xmlns=\"http://maven.apache.org/POM/4.6.0\">\n\
-        <modelVersion>4.6.0</modelVersion>\n\
+        <project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n\
+        <modelVersion>4.0.0</modelVersion>\n\
         <groupId>jgl</groupId>\n\
         <artifactId>jgl-project</artifactId>\n\
         <version>0.1.0</version>\n\
@@ -266,7 +283,7 @@ fn generate_gemfile(entries: &[DependencyEntry]) -> Result<String, JglcError> {
         if entry.version == "*" {
             content.push_str(&format!("gem '{}'\n", entry.name));
         } else {
-            content.push_str(&format!("gem '{}'\n", entry.name));
+            content.push_str(&format!("gem '{}', {}\n", entry.name, &entry.version));
         }
     }
     
@@ -291,11 +308,14 @@ fn generate_composer_json(entries: &[DependencyEntry]) -> Result<String, JglcErr
 
 fn generate_build_zig_zon(entries: &[DependencyEntry]) -> Result<String, JglcError> {
     let mut content = String::from(".{\n");
-    
+
     for entry in entries {
-        content.push_str(&format!("    .{} = .{{}},\n", entry.name));
+        content.push_str(&format!(
+            "    \"{}\" = .{{\n        .url = \"https://github.com/{}/{}.git\",\n        .hash = \"1234567890abcdef\",\n    }},\n",
+            entry.name, entry.name, entry.name
+        ));
     }
-    
+
     content.push_str("}\n");
     Ok(content)
 }

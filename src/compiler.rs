@@ -84,8 +84,8 @@ fn compile_project(project_path: &Path, output_dir: &Path, bundle_only: bool, ta
 
     let result = std::process::Command::new("bash")
         .arg(&build_sh)
+        .current_dir(output_dir)
         .status();
-    
     match result {
         Ok(status) => {
             if status.success() {

@@ -1,6 +1,6 @@
 use crate::parser::Block;
 use crate::error::JglcError;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Compile target specification
@@ -296,9 +296,33 @@ pub fn resolve_imports(
     manifest: &mut Manifest,
     base_dir: &Path,
 ) -> Result<Vec<crate::parser::Block>, JglcError> {
+    resolve_imports_inner(manifest, base_dir, &mut HashSet::new())
+}
+
+/// Internal recursive implementation with cycle detection
+fn resolve_imports_inner(
+    manifest: &mut Manifest,
+    base_dir: &Path,
+    visited: &mut HashSet<PathBuf>,
+) -> Result<Vec<crate::parser::Block>, JglcError> {
     let mut imported_blocks: Vec<crate::parser::Block> = Vec::new();
 
     for import in &manifest.imports {
+        let import_path = if import.is_absolute() {
+            import.clone()
+        } else {
+            base_dir.join(import)
+        };
+
+        let canonical = import_path.canonicalize().unwrap_or(import_path.clone());
+        if visited.contains(&canonical) {
+            return Err(JglcError::Import(format!(
+                "Circular import detected: {}",
+                import_path.display()
+            )));
+        }
+        visited.insert(canonical.clone());
+
         let import_path = if import.is_absolute() {
             import.clone()
         } else {
@@ -320,7 +344,7 @@ pub fn resolve_imports(
         if let Some(imported_manifest) = imported.manifest {
             let mut sub_manifest = Manifest::parse(&imported_manifest)?;
             // Depth-first resolution: recursively resolve sub-imports
-            let sub_imports = resolve_imports(&mut sub_manifest, import_path.parent().unwrap_or(base_dir))?;
+            let sub_imports = resolve_imports_inner(&mut sub_manifest, import_path.parent().unwrap_or(base_dir), visited)?;
             imported_blocks.extend(sub_imports);
 
             // Merge dependencies

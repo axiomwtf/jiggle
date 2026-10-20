@@ -664,7 +664,7 @@ script.push_str("fi\n\n");
         script.push_str("    FILE *tf = fopen(\"/tmp/_jgl_lua_${method}.lua\", \"w\");\n");
         script.push_str("    if (tf) { fwrite(${var_name}_data, 1, ${var_name}_len, tf); fclose(tf); }\n");
         script.push_str("    char cmd[1024];\n");
-        script.push_str("    snprintf(cmd, sizeof(cmd), \"lua -e 'assert(loadfile(\\\"/tmp/_jgl_lua_${method}.lua\\\"))(); print(${method}(tonumber(arg[0])))' %g 2>/dev/null\", a);\n");
+        script.push_str("    snprintf(cmd, sizeof(cmd), \"lua -e 'local a=%g; assert(loadfile(\\\"/tmp/_jgl_lua_${method}.lua\\\"))(); print(%s(a))' 2>/dev/null\", a, \"${method}\");\n");
         script.push_str("    FILE *p = popen(cmd, \"r\");\n");
         script.push_str("    double result = 0.0;\n");
         script.push_str("    if (p) { fscanf(p, \"%lf\", &result); pclose(p); }\n");
