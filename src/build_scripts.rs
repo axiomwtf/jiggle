@@ -115,20 +115,37 @@ script.push_str("fi\n\n");
             if rust_is_main && has_cargo {
                 // Cargo.toml + Rust main: use cargo build
                 script.push_str("# Rust with Cargo.toml - full cargo build\n");
-                script.push_str("if command -v cargo &> /dev/null; then\n");
+                if target_win {
+                    script.push_str("if command -v rustup &> /dev/null; then\n");
+                } else {
+                    script.push_str("if command -v cargo &> /dev/null; then\n");
+                }
                 script.push_str("    echo \"Step 0: Creating dummy lib file for cargo...\"\n");
                 script.push_str("    echo '' > jgl_dummy.rs\n");
-                script.push_str("    echo \"Step 1: Building with cargo...\"\n");
-                script.push_str("    cargo build 2>&1 || echo \"Warning: cargo build had issues\"\n");
+                if target_win {
+                    script.push_str("    echo \"Step 1: Building with cargo (cross-compiled to Windows)...\"\n");
+                    script.push_str("    rustup run stable cargo build --release --target x86_64-pc-windows-gnu 2>&1 || echo \"Warning: cargo build had issues\"\n");
+                } else {
+                    script.push_str("    echo \"Step 1: Building with cargo...\"\n");
+                    script.push_str("    cargo build 2>&1 || echo \"Warning: cargo build had issues\"\n");
+                }
                 script.push_str("    echo \"Step 2: Copying binary...\"\n");
-                script.push_str(&format!("    cp target/release/{bin_name} . 2>/dev/null || cp target/debug/{bin_name} . 2>/dev/null || true\n"));
+                if target_win {
+                    script.push_str(&format!("    cp target/x86_64-pc-windows-gnu/release/{bin_name}.exe . 2>/dev/null || true\n"));
+                } else {
+                    script.push_str(&format!("    cp target/release/{bin_name} . 2>/dev/null || cp target/debug/{bin_name} . 2>/dev/null || true\n"));
+                }
                 script.push_str("else\n");
                 script.push_str("    echo \"Warning: cargo not found, skipping Rust\"\n");
                 script.push_str("fi\n\n");
             } else if rust_is_main && !has_cargo {
                 // No Cargo.toml but has Rust main: compile combined crate to binary
                 script.push_str("# Rust (no Cargo.toml, has main) - compiling to binary\n");
-                script.push_str("if command -v rustc &> /dev/null; then\n");
+                if target_win {
+                    script.push_str("if command -v rustup &> /dev/null; then\n");
+                } else {
+                    script.push_str("if command -v rustc &> /dev/null; then\n");
+                }
                 script.push_str("    COMBINED_RS=\"jgl_combined_main.rs\"\n");
                 script.push_str("    echo '#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]' > \"$COMBINED_RS\"\n");
                 // Fix #[no_mangle] for Rust 2024 edition
@@ -155,10 +172,15 @@ script.push_str("fi\n\n");
                 script.push_str("    for native in native_*.o; do\n");
                 script.push_str("        if [ -f \"$native\" ]; then LINK_ARGS=\"$LINK_ARGS -C link-arg=$native\"; fi\n");
                 script.push_str("    done\n");
-                script.push_str("    LINK_ARGS=\"$LINK_ARGS -C link-arg=-lm -C link-arg=-lpthread -C link-arg=-ldl\"\n");
+                if target_win {
+                    script.push_str("    LINK_ARGS=\"$LINK_ARGS -C link-arg=-lm\"\n");
+                } else {
+                    script.push_str("    LINK_ARGS=\"$LINK_ARGS -C link-arg=-lm -C link-arg=-lpthread -C link-arg=-ldl\"\n");
+                }
                 let bin_name_rs = if target_win { format!("{}.exe", bin_name) } else { bin_name.to_string() };
                 let target_flag = if target_win { " --target=x86_64-pc-windows-gnu" } else { "" };
-                script.push_str(&format!("    rustc --edition 2024 -O -o {} --crate-type=bin{target_flag} \"$COMBINED_RS\" $LINK_ARGS 2>&1 || echo \"Warning: Rust linking failed\"\n", bin_name_rs, target_flag=target_flag));
+                let rustc_cmd = if target_win { "rustup run stable rustc" } else { "rustc" };
+                script.push_str(&format!("    {rustc_cmd} --edition 2024 -O -o {} --crate-type=bin{target_flag} \"$COMBINED_RS\" $LINK_ARGS 2>&1 || echo \"Warning: Rust linking failed\"\n", bin_name_rs, target_flag=target_flag, rustc_cmd=rustc_cmd));
                 script.push_str(&format!("    if [ -f {} ]; then echo \"Linked unified native binary: {}\"; fi\n", bin_name_rs, bin_name_rs));
                 script.push_str("else\n");
                 script.push_str("    echo \"Warning: Rust compiler (rustc) not found, skipping Rust compilation\"\n");
@@ -166,7 +188,11 @@ script.push_str("fi\n\n");
             } else {
                 // No Rust main: compile each .rs file to object file, link with others
                 script.push_str("# Rust (no main _rs) - compiling to object files for linking\n");
-                script.push_str("if command -v rustc &> /dev/null; then\n");
+                if target_win {
+                    script.push_str("if command -v rustup &> /dev/null; then\n");
+                } else {
+                    script.push_str("if command -v rustc &> /dev/null; then\n");
+                }
             for f in files {
                     let out_name = format!("rust_{}.o", f.replace(".rs", ""));
                     object_files.push(out_name.clone());
@@ -175,8 +201,9 @@ script.push_str("fi\n\n");
                     // Fix #[no_mangle] -> #[unsafe(no_mangle)] for rustc 1.82+
                     script.push_str(&format!("    sed 's/#\\[no_mangle\\]/#[unsafe(no_mangle)]/g' {} > _{}_fixed.rs\n", sh_quote(f), f.replace(".rs", "")));
                     let rustc_win_target = if target_win { " --target=x86_64-pc-windows-gnu" } else { "" };
-                    script.push_str(&format!("    rustc --edition 2024 -O --crate-type=lib --emit=obj -o {} _{}_fixed.rs{} 2>&1 || echo \"Warning: Rust compilation failed for {}\"\n",
-                        sh_quote(&out_name), f.replace(".rs", ""), rustc_win_target, sh_quote(f)));
+                    let rustc_cmd = if target_win { "rustup run stable rustc" } else { "rustc" };
+                    script.push_str(&format!("    {} --edition 2024 -O --crate-type=lib --emit=obj -o {} _{}_fixed.rs{} 2>&1 || echo \"Warning: Rust compilation failed for {}\"\n",
+                        rustc_cmd, sh_quote(&out_name), f.replace(".rs", ""), rustc_win_target, sh_quote(f)));
             }
             script.push_str("else\n");
                 script.push_str("    echo \"Warning: Rust compiler (rustc) not found, skipping Rust compilation\"\n");
@@ -188,22 +215,34 @@ script.push_str("fi\n\n");
     // Go compilation - compile to static archives for linking
     if let Some(files) = files_by_lang.get("go") {
         if !files.is_empty() {
-            script.push_str("# Go - compiled as C archives for static linking\n");
-            script.push_str("if command -v go &> /dev/null; then\n");
-            for (i, f) in files.iter().enumerate() {
-                let a_name = f.replace(".go", &format!("_{}.a", i));
-                // Use the .a archive directly as linker input (contains Go runtime + cgo)
-                script.push_str(&format!("    echo \"Compiling Go: {}\"\n", f));
-                let go_target = if target_win { "GOOS=windows GOARCH=amd64 CGO_ENABLED=0" } else { "" };
-                script.push_str(&format!("    {} go build -buildmode=c-archive -o {} {} 2>&1 || echo \"Warning: Go compilation failed for {}\"\n",
-                    go_target, sh_quote(&a_name), sh_quote(f), sh_quote(f)));
+            if target_win {
+                script.push_str("# Go (cross-compiled to Windows)\n");
+                script.push_str("if command -v go &> /dev/null; then\n");
+                for (i, f) in files.iter().enumerate() {
+                    let a_name = f.replace(".go", &format!("_{}.a", i));
+                    script.push_str(&format!("    echo \"Compiling Go: {}\"\n", f));
+                    script.push_str(&format!("    GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc go build -buildmode=c-archive -o {} {} 2>&1 || echo \"Warning: Go compilation failed for {}\"\n",
+                        sh_quote(&a_name), sh_quote(f), sh_quote(f)));
+                }
+                script.push_str("else\n");
+                script.push_str("    echo \"Warning: Go compiler (go) not found, skipping Go compilation\"\n");
+                script.push_str("fi\n\n");
+            } else {
+                script.push_str("# Go - compiled as C archives for static linking\n");
+                script.push_str("if command -v go &> /dev/null; then\n");
+                for (i, f) in files.iter().enumerate() {
+                    let a_name = f.replace(".go", &format!("_{}.a", i));
+                    // Use the .a archive directly as linker input (contains Go runtime + cgo)
+                    script.push_str(&format!("    echo \"Compiling Go: {}\"\n", f));
+                    script.push_str(&format!("    go build -buildmode=c-archive -o {} {} 2>&1 || echo \"Warning: Go compilation failed for {}\"\n",
+                        sh_quote(&a_name), sh_quote(f), sh_quote(f)));
+                }
+                script.push_str("else\n");
+                script.push_str("    echo \"Warning: Go compiler (go) not found, skipping Go compilation\"\n");
+                script.push_str("fi\n\n");
             }
-            script.push_str("else\n");
-            script.push_str("    echo \"Warning: Go compiler (go) not found, skipping Go compilation\"\n");
-            script.push_str("fi\n\n");
         }
     }
-    
     // C compilation
     if let Some(c_files) = files_by_lang.get("c") {
         if !c_files.is_empty() {
@@ -269,13 +308,14 @@ script.push_str("fi\n\n");
     // Zig compilation
     if let Some(files) = files_by_lang.get("zig") {
         if !files.is_empty() {
+            let zig_target = if target_win { " -Dtarget=x86_64-windows-gnu" } else { "" };
             script.push_str("# Zig\n");
             script.push_str("if command -v zig &> /dev/null; then\n");
             for f in files {
                 let out_name = format!("zig_{}.o", f.replace(".zig", ""));
                 object_files.push(out_name.clone());
                 native_objects.push(out_name.clone());
-                script.push_str(&format!("    zig build-obj -O ReleaseSmall -femit-bin={} {} 2>&1 || echo \"Warning: Failed to compile {}\"\n", sh_quote(&out_name), sh_quote(f), sh_quote(f)));
+                script.push_str(&format!("    zig build-obj -O ReleaseSmall -femit-bin={} {}{} 2>&1 || echo \"Warning: Failed to compile {}\"\n", sh_quote(&out_name), sh_quote(f), zig_target, sh_quote(f)));
             }
             script.push_str("else\n");
             script.push_str("    echo \"Warning: Zig compiler (zig) not found, skipping Zig compilation\"\n");
@@ -286,43 +326,78 @@ script.push_str("fi\n\n");
     // Nim compilation
     if let Some(files) = files_by_lang.get("nim") {
         if !files.is_empty() {
-            script.push_str("# Nim\n");
-            script.push_str("if command -v nim &> /dev/null; then\n");
-            for f in files {
-                let out_name = format!("nim_{}.o", f.replace(".nim", ""));
-                let nim_obj = format!("nimcache_nim/@m{}.c.o", f.replace("/", "@"));
-                script.push_str(&format!("    nim c --noLinking --passC:-O2 --passC:-fPIC --nimcache:nimcache_nim -o:{} {} 2>&1 || echo \"Warning: Failed to compile {}\"\n", sh_quote(&out_name), sh_quote(f), sh_quote(f)));
-                let base_name = f.replace(".nim", "");
-                script.push_str(&format!("    objcopy --redefine-sym main=nim_main_{} {} 2>/dev/null || true\n", sh_quote(&base_name), sh_quote(&nim_obj)));
-                script.push_str(&format!("    NATIVE_OBJECTS=\"$NATIVE_OBJECTS {}\"\n", nim_obj));
+            if target_win {
+                script.push_str("# Nim (cross-compiled to Windows)\n");
+                script.push_str("if command -v nim &> /dev/null; then\n");
+                for f in files {
+                    let out_name = format!("nim_{}.o", f.replace(".nim", ""));
+                    let nim_obj = format!("nimcache_nim/@m{}.c.o", f.replace("/", "@"));
+                    script.push_str(&format!("    CC=x86_64-w64-mingw32-gcc nim c --noLinking -d:release -d:mingw --cpu:amd64 --passC:\"-I/usr/x86_64-w64-mingw32/include\" --passC:\"--sysroot=/usr/x86_64-w64-mingw32\" --nimcache:nimcache_nim -o:{} {} 2>&1 || echo \"Warning: Failed to compile {}\"\n", sh_quote(&out_name), sh_quote(f), sh_quote(f)));
+                    let base_name = f.replace(".nim", "");
+                    script.push_str(&format!("    objcopy --redefine-sym main=nim_main_{} {} 2>/dev/null || echo \"Warning: objcopy failed for {}\"\n", sh_quote(&base_name), sh_quote(&nim_obj), sh_quote(&base_name)));
+                    script.push_str(&format!("    NATIVE_OBJECTS=\"$NATIVE_OBJECTS {}\"\n", nim_obj));
+                }
+                // Collect all Nim runtime objects from nimcache (system.nim, etc.)
+                script.push_str("            for no in nimcache_nim/*.o; do\n");
+                script.push_str("                if [ -f \"$no\" ]; then NATIVE_OBJECTS=\"$NATIVE_OBJECTS $no\"; fi\n");
+                script.push_str("            done\n");
+                script.push_str("            # Deduplicate NATIVE_OBJECTS\n");
+                script.push_str("            NATIVE_OBJECTS=$(echo $NATIVE_OBJECTS | tr ' ' '\\n' | sort -u | tr '\\n' ' ')\n");
+                script.push_str("else\n");
+                script.push_str("    echo \"Warning: Nim compiler (nim) not found, skipping Nim compilation\"\n");
+                script.push_str("fi\n\n");
+            } else {
+                script.push_str("# Nim\n");
+                script.push_str("if command -v nim &> /dev/null; then\n");
+                for f in files {
+                    let out_name = format!("nim_{}.o", f.replace(".nim", ""));
+                    let nim_obj = format!("nimcache_nim/@m{}.c.o", f.replace("/", "@"));
+                    script.push_str(&format!("    nim c --noLinking --passC:-O2 --passC:-fPIC --nimcache:nimcache_nim -o:{} {} 2>&1 || echo \"Warning: Failed to compile {}\"\n", sh_quote(&out_name), sh_quote(f), sh_quote(f)));
+                    let base_name = f.replace(".nim", "");
+                    script.push_str(&format!("    objcopy --redefine-sym main=nim_main_{} {} 2>/dev/null || true\n", sh_quote(&base_name), sh_quote(&nim_obj)));
+                    script.push_str(&format!("    NATIVE_OBJECTS=\"$NATIVE_OBJECTS {}\"\n", nim_obj));
+                }
+                // Collect all Nim runtime objects from nimcache (system.nim, etc.)
+                script.push_str("            for no in nimcache_nim/*.o; do\n");
+                script.push_str("                if [ -f \"$no\" ]; then NATIVE_OBJECTS=\"$NATIVE_OBJECTS $no\"; fi\n");
+                script.push_str("            done\n");
+                // Remove duplicate main module objects (already added with renamed main)
+                script.push_str("            # Deduplicate NATIVE_OBJECTS\n");
+                script.push_str("            NATIVE_OBJECTS=$(echo $NATIVE_OBJECTS | tr ' ' '\\n' | sort -u | tr '\\n' ' ')\n");
+                script.push_str("else\n");
+                script.push_str("    echo \"Warning: Nim compiler (nim) not found, skipping Nim compilation\"\n");
+                script.push_str("fi\n\n");
             }
-            // Collect all Nim runtime objects from nimcache (system.nim, etc.)
-            script.push_str("            for no in nimcache_nim/*.o; do\n");
-            script.push_str("                if [ -f \"$no\" ]; then NATIVE_OBJECTS=\"$NATIVE_OBJECTS $no\"; fi\n");
-            script.push_str("            done\n");
-            // Remove duplicate main module objects (already added with renamed main)
-            script.push_str("            # Deduplicate NATIVE_OBJECTS\n");
-            script.push_str("            NATIVE_OBJECTS=$(echo $NATIVE_OBJECTS | tr ' ' '\\n' | sort -u | tr '\\n' ' ')\n");
-            script.push_str("else\n");
-            script.push_str("    echo \"Warning: Nim compiler (nim) not found, skipping Nim compilation\"\n");
-            script.push_str("fi\n\n");
         }
     }
-    
     // Fortran compilation
     if let Some(files) = files_by_lang.get("f90") {
         if !files.is_empty() {
-            script.push_str("# Fortran\n");
-            script.push_str("if command -v gfortran &> /dev/null; then\n");
-            for f in files {
-                let out_name = format!("fortran_{}", f.replace(".f90", ".o"));
-                object_files.push(out_name.clone());
-                native_objects.push(out_name.clone());
-                script.push_str(&format!("    gfortran -fno-underscoring -O2 -c -fPIC -o {} {} 2>&1 || echo \"Warning: Failed to compile {}\"\n", sh_quote(&out_name), sh_quote(f), sh_quote(f)));
+            if target_win {
+                script.push_str("# Fortran (cross-compiled to Windows)\n");
+                script.push_str("if command -v x86_64-w64-mingw32-gfortran &> /dev/null; then\n");
+                for f in files {
+                    let out_name = format!("fortran_{}", f.replace(".f90", ".o"));
+                    object_files.push(out_name.clone());
+                    native_objects.push(out_name.clone());
+                    script.push_str(&format!("    x86_64-w64-mingw32-gfortran -fno-underscoring -O2 -c -o {} {} 2>&1 || echo \"Warning: Failed to compile {}\"\n", sh_quote(&out_name), sh_quote(f), sh_quote(f)));
+                }
+                script.push_str("else\n");
+                script.push_str("    echo \"Warning: Windows Fortran compiler (x86_64-w64-mingw32-gfortran) not found, skipping Fortran compilation\"\n");
+                script.push_str("fi\n\n");
+            } else {
+                script.push_str("# Fortran\n");
+                script.push_str("if command -v gfortran &> /dev/null; then\n");
+                for f in files {
+                    let out_name = format!("fortran_{}", f.replace(".f90", ".o"));
+                    object_files.push(out_name.clone());
+                    native_objects.push(out_name.clone());
+                    script.push_str(&format!("    gfortran -fno-underscoring -O2 -c -fPIC -o {} {} 2>&1 || echo \"Warning: Failed to compile {}\"\n", sh_quote(&out_name), sh_quote(f), sh_quote(f)));
+                }
+                script.push_str("else\n");
+                script.push_str("    echo \"Warning: Fortran compiler (gfortran) not found, skipping Fortran compilation\"\n");
+                script.push_str("fi\n\n");
             }
-            script.push_str("else\n");
-            script.push_str("    echo \"Warning: Fortran compiler (gfortran) not found, skipping Fortran compilation\"\n");
-            script.push_str("fi\n\n");
         }
     }
     
@@ -451,8 +526,13 @@ script.push_str("fi\n\n");
     if !script_files.is_empty() {
         script.push_str("# Scripting languages - embedding source as C data segments\n");
         script.push_str("# These are compiled to .o files and linked into the unified binary\n");
-        script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
-        script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+        if target_win {
+            script.push_str("if command -v x86_64-w64-mingw32-gcc &> /dev/null || command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+            script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then SCRIPT_CC=x86_64-w64-mingw32-gcc; elif command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+        } else {
+            script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+            script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+        }
         script.push_str("    for script_file in *.js *.ts *.tsx *.jsx *.py *.lua *.bs *.rb *.sh *.php; do\n");
         script.push_str("        if [ -f \"$script_file\" ]; then\n");
         script.push_str("            # Convert filename to C variable name\n");
@@ -489,8 +569,13 @@ script.push_str("fi\n\n");
     if has_jvm {
         script.push_str("# Generate FFI bridge for JVM languages\n");
         script.push_str("# Creates C wrapper functions that call Java methods via subprocess\n");
-        script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
-        script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+        if target_win {
+            script.push_str("if command -v x86_64-w64-mingw32-gcc &> /dev/null || command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+            script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then SCRIPT_CC=x86_64-w64-mingw32-gcc; elif command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+        } else {
+            script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+            script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+        }
         script.push_str("    if [ -f jgl_java.jar ] && command -v javac &> /dev/null; then\n");
         script.push_str("        cat > JglJavaBridge.java << 'JAVA_BRIDGE'\n");
         script.push_str("import java.lang.reflect.*;\n");
@@ -505,6 +590,7 @@ script.push_str("fi\n\n");
         script.push_str("JAVA_BRIDGE\n");
         script.push_str("        javac -d classes JglJavaBridge.java 2>/dev/null && jar uf jgl_java.jar -C classes JglJavaBridge.class 2>/dev/null || true\n");
         script.push_str("        echo '/* FFI bridge for Java methods */' > ffi_jgl_java.c\n");
+        script.push_str("        echo '#define _GNU_SOURCE' >> ffi_jgl_java.c\n");
         script.push_str("        echo '#include <stdio.h>' >> ffi_jgl_java.c\n");
         script.push_str("        echo '#include <stdlib.h>' >> ffi_jgl_java.c\n");
         script.push_str("        echo '#include <stdint.h>' >> ffi_jgl_java.c\n");
@@ -541,8 +627,13 @@ script.push_str("fi\n\n");
     
     if has_cs {
         script.push_str("# Generate FFI bridge for C#\n");
-        script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
-        script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+        if target_win {
+            script.push_str("if command -v x86_64-w64-mingw32-gcc &> /dev/null || command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+            script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then SCRIPT_CC=x86_64-w64-mingw32-gcc; elif command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+        } else {
+            script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+            script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+        }
         script.push_str("    if [ -f jgl_cs.dll ]; then\n");
         // Generate C# console bridge that uses reflection
         script.push_str("        mkdir -p jgl_cs_runner\n");
@@ -591,6 +682,8 @@ script.push_str("fi\n\n");
         script.push_str("            if [ -f \"$r\" ]; then cp \"$r\" jgl_cs_bridge.runtimeconfig.json 2>/dev/null; fi\n");
         script.push_str("        done\n");
         // Generate C FFI stubs for each public static double method in C# files
+        script.push_str("        echo '/* FFI bridge for C# methods */' > ffi_jgl_cs.c\n");
+        script.push_str("        echo '#define _GNU_SOURCE' >> ffi_jgl_cs.c\n");
         script.push_str("        echo '#include <stdio.h>' >> ffi_jgl_cs.c\n");
         script.push_str("        echo '#include <stdlib.h>' >> ffi_jgl_cs.c\n");
         script.push_str("        echo '#include <string.h>' >> ffi_jgl_cs.c\n");
@@ -642,9 +735,15 @@ script.push_str("fi\n\n");
     if has_py {
         script.push_str("# Generate FFI bridge for Python\n");
         script.push_str("# Python runtimes are NOT bundled - declared as a runtime dependency\n");
-        script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
-        script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+        if target_win {
+            script.push_str("if command -v x86_64-w64-mingw32-gcc &> /dev/null || command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+            script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then SCRIPT_CC=x86_64-w64-mingw32-gcc; elif command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+        } else {
+            script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+            script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+        }
         script.push_str("    echo '/* FFI bridge for Python methods */' > ffi_jgl_python.c\n");
+        script.push_str("    echo '#define _GNU_SOURCE' >> ffi_jgl_python.c\n");
         script.push_str("    echo '#include <stdio.h>' >> ffi_jgl_python.c\n");
         script.push_str("    echo '#include <stdlib.h>' >> ffi_jgl_python.c\n");
         script.push_str("    echo '#include <string.h>' >> ffi_jgl_python.c\n");
@@ -679,9 +778,15 @@ script.push_str("fi\n\n");
     if has_lua {
         script.push_str("# Generate FFI bridge for Lua\n");
         script.push_str("# Lua runtimes are NOT bundled - declared as a runtime dependency\n");
-        script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
-        script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+        if target_win {
+            script.push_str("if command -v x86_64-w64-mingw32-gcc &> /dev/null || command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+            script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then SCRIPT_CC=x86_64-w64-mingw32-gcc; elif command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+        } else {
+            script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+            script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+        }
         script.push_str("    echo '/* FFI bridge for Lua methods */' > ffi_jgl_lua.c\n");
+        script.push_str("    echo '#define _GNU_SOURCE' >> ffi_jgl_lua.c\n");
         script.push_str("    echo '#include <stdio.h>' >> ffi_jgl_lua.c\n");
         script.push_str("    echo '#include <stdlib.h>' >> ffi_jgl_lua.c\n");
         script.push_str("    echo '#include <string.h>' >> ffi_jgl_lua.c\n");
@@ -717,9 +822,17 @@ script.push_str("fi\n\n");
     if has_ts {
         script.push_str("# Generate FFI bridge for TypeScript\n");
         script.push_str("# TypeScript was precompiled to JS at build time; use node directly\n");
-        script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
-        script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+        if target_win {
+            script.push_str("if command -v x86_64-w64-mingw32-gcc &> /dev/null || command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+            script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then SCRIPT_CC=x86_64-w64-mingw32-gcc; elif command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+        } else {
+            script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+            script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+        }
+        script.push_str("    echo '/* FFI bridge for TypeScript */' > ffi_jgl_ts.c\n");
+        script.push_str("    echo '#define _GNU_SOURCE' >> ffi_jgl_ts.c\n");
         script.push_str("    echo '#include <stdio.h>' >> ffi_jgl_ts.c\n");
+        script.push_str("    echo '#include <stdlib.h>' >> ffi_jgl_ts.c\n");
         script.push_str("    echo '#include <string.h>' >> ffi_jgl_ts.c\n");
         script.push_str("    echo '#include <stdint.h>' >> ffi_jgl_ts.c\n");
         // Iterate .ts files, find their precompiled .js counterparts
@@ -777,8 +890,13 @@ script.push_str("fi\n\n");
     // Must come AFTER FFI bridge generation (which adds JglJavaBridge to JAR
     // and builds C# runner DLL) so the embedded data includes those additions
     script.push_str("# Embed binary payloads (JARs, DLLs) as C data segments\n");
-    script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
-    script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+    if target_win {
+        script.push_str("if command -v x86_64-w64-mingw32-gcc &> /dev/null || command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+        script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then SCRIPT_CC=x86_64-w64-mingw32-gcc; elif command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+    } else {
+        script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+        script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+    }
     script.push_str("    for jar_file in *.jar *.dll *.runtimeconfig.json; do\n");
     script.push_str("        if [ -f \"$jar_file\" ]; then\n");
     script.push_str("            var_name=$(echo \"$jar_file\" | tr '.' '_' | tr '-' '_')\n");
