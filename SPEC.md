@@ -332,4 +332,4 @@ readme._md {
 - The manifest block is conventionally named `project`, matching `project.jgl`
 - `dep[lang]` is manifest-only. Outside `project._jgl` it is a parse error
 - `jgl` is short for Jiggle
-- The compiler is written in Rust (edition 2024) and lives in `jglc/`
+The compiler is written in Rust (edition 2024) and lives in `src/`

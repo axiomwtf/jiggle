@@ -82,7 +82,7 @@ Aliases: `build` for `compile`, `check` for `validate`, `gen` for `generate`. Ev
 
 ## Building from source
 
-The compiler is written in Rust (edition 2024) and lives in [`jglc/`](./jglc).
+The compiler is written in Rust (edition 2024) and lives in [`src/`](./src).
 
 ```bash
 cd jglc
