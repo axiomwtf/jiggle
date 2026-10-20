@@ -236,7 +236,7 @@ fn parse_block_body_balanced(chars: &[char], pos: &mut usize) -> Option<(Vec<cha
 
         // Not in a string - check for block delimiters and string starts
         match c {
-            '"' | '`' => {
+            '"' | '\'' | '`' => {
                 str_state = Some(c);
             }
             '{' => {

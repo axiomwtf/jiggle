@@ -310,9 +310,14 @@ fn generate_build_zig_zon(entries: &[DependencyEntry]) -> Result<String, JglcErr
     let mut content = String::from(".{\n");
 
     for entry in entries {
+        let url = if entry.version == "*" {
+            format!("https://github.com/{}/{}.git", entry.name, entry.name)
+        } else {
+            format!("https://github.com/{}/{}/archive/{}.tar.gz", entry.name, entry.name, entry.version)
+        };
         content.push_str(&format!(
-            "    \"{}\" = .{{\n        .url = \"https://github.com/{}/{}.git\",\n        .hash = \"1234567890abcdef\",\n    }},\n",
-            entry.name, entry.name, entry.name
+            "    \"{}\" = .{{\n        .url = \"{}\",\n        // Run `zig fetch` to generate the correct .hash\n        .hash = \"0000000000000000000000000000000000000000000000000000000000000000\",\n    }},\n",
+            entry.name, url
         ));
     }
 
