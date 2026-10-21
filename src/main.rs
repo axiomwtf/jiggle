@@ -4,6 +4,7 @@ mod vfs;
 mod deps;
 mod bundler;
 mod build_scripts;
+mod ffi;
 mod compiler;
 mod cli;
 mod error;

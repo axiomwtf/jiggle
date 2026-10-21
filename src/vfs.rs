@@ -85,12 +85,12 @@ pub fn build_vfs(
 
     // Process each block
     for block in blocks {
-        let filename = if block.is_manifest {
+        let mut filename = if block.is_manifest {
             if block.is_project_manifest {
                 // The project manifest is kept as project._jgl
                 continue; // Manifest is not a VFS file but handled separately
             } else {
-                continue; // Non-project _jgl blocks are discarded
+                continue; // Non-project ._jgl blocks are discarded
             }
         } else if block.is_named {
             // Named block: name.extension
@@ -100,6 +100,26 @@ pub fn build_vfs(
             format!("v{}.{}", block.name, block.language)
         };
 
+        // A Java file has to be named after the class it declares, so that
+        // javac accepts a public class. A file may hold at most one public
+        // type, so a block that declares two of them is refused here
+        // rather than by the compiler of Java.
+        let body = dedent(&block.body);
+        if block.language == "java" {
+            let names = public_class_names(&body);
+            if names.len() > 1 {
+                return Err(JglcError::Compiler(format!(
+                    "The Java block declares more than one public type (\"{}\" and \"{}\"). \
+                     A Java file may hold at most one public type, so each of them needs a \
+                     block of its own.",
+                    names[0], names[1]
+                )));
+            }
+            if let Some(class_name) = names.first() {
+                filename = format!("{}.java", class_name);
+            }
+        }
+
         // Determine file properties
         let language = block.language.clone();
         let is_custom = custom_extensions.contains(&language);
@@ -107,7 +127,6 @@ pub fn build_vfs(
 
         // Generate lint suppressors (per spec, section 5)
         let mut content = generate_lint_suppressor(&language);
-        let body = dedent(&block.body);
         if !body.is_empty() {
             if !content.is_empty() {
                 content.push('\n');
@@ -130,12 +149,32 @@ pub fn build_vfs(
     Ok(vfs)
 }
 
+/// The public types a Java source declares. A Java file has to be named
+/// after the public type it contains, otherwise javac rejects it, and a
+/// file may hold at most one public type. The type may be a class, an enum,
+/// an interface or a record. Only the types at the top level count: a
+/// public type nested in another one does not need the file to be named
+/// after it.
+fn public_class_names(source: &str) -> Vec<String> {
+    let Ok(re) = regex::Regex::new(
+        r"(?m)^public\s+(?:final\s+|abstract\s+|sealed\s+|non-sealed\s+|static\s+)*(?:class|enum|interface|record)\s+([A-Za-z_][A-Za-z0-9_]*)",
+    ) else {
+        return Vec::new();
+    };
+    re.captures_iter(source)
+        .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+        .collect()
+}
+
 /// Generate the appropriate lint/style suppressor for each language
 fn generate_lint_suppressor(lang: &str) -> String {
     match lang {
         "rs" => "#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]",
-        "java" => "@SuppressWarnings(\"all\")",
-        "kt" => "@Suppress(\"all\")",
+        // Java and Kotlin file annotations have to follow the package
+        // declaration, so they are not put in front of the file. Their
+        // compilers are told to stay quiet instead.
+        "java" => "",
+        "kt" => "",
         "cs" => "#pragma warning disable",
         "js" => "/* eslint-disable */",
         "ts" => "// @ts-nocheck",

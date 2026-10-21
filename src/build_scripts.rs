@@ -1,14 +1,55 @@
 use crate::error::JglcError;
+use crate::ffi::{
+    c_function_name, lua_local_functions, normalize_type_name, package_name, parse_methods, JglType,
+    MethodSig, Param,
+};
 use crate::manifest::{Manifest, CustomLanguage};
 use crate::vfs::Vfs;
 use std::path::Path;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use regex::Regex;
 
 /// Shell-quote a string for safe use in bash scripts
 fn sh_quote(s: &str) -> String {
     // Use single quotes and escape any embedded single quotes
     format!("'{}'", s.replace("'", "'\\''"))
 
+}
+/// The step that follows a failed compilation of a language.
+///
+/// A language that owns FFI methods cannot be compiled with a warning: the
+/// bridge of that language would be dead, and every call through it would
+/// answer zero without a word. The build stops instead.
+fn compile_failure_step(owns_ffi: bool, language: &str) -> String {
+    if owns_ffi {
+        format!(
+            "2>&1 || {{ echo \"error: the {lang} sources of the project did not compile, so the FFI bridge of {lang} would be dead\" >&2; exit 1; }}\n",
+            lang = language
+        )
+    } else {
+        format!("2>&1 || echo \"Warning: Failed to compile {}\"\n", language)
+    }
+}
+
+/// The step that follows a missing compiler of a language.
+///
+/// A language that owns FFI methods needs its compiler: without it the
+/// bridge of that language is dead, and every call through it answers zero
+/// without a word. The build stops instead of going on.
+fn missing_compiler_step(owns_ffi: bool, language: &str, compiler: &str) -> String {
+    if owns_ffi {
+        format!(
+            "    echo \"error: the {lang} compiler ({comp}) is not installed, but the project has {lang} methods that the FFI bridge exposes\" >&2\n    exit 1\n",
+            lang = language,
+            comp = compiler
+        )
+    } else {
+        format!(
+            "    echo \"Warning: {lang} compiler ({comp}) not found, skipping {lang} compilation\"\n",
+            lang = language,
+            comp = compiler
+        )
+    }
 }
 
 /// Generate build.sh for Unix systems
@@ -91,6 +132,64 @@ script.push_str("fi\n\n");
             }
             files_by_lang.entry(entry.language.clone()).or_default().push(path.clone());
         }
+    }
+
+    // The methods the FFI bridges expose. They are collected before
+    // anything is compiled, because the build has to refuse a stub that
+    // would take over the name of a C library function before it compiles
+    // anything at all.
+    let mut all_ffi_methods: Vec<FfiMethod> = Vec::new();
+    for lang in FFI_LANGS {
+        all_ffi_methods.extend(collect_ffi_methods(lang, &files_by_lang, vfs));
+    }
+    // The languages whose methods the project exposes through the bridge.
+    // A language that owns methods cannot be compiled with a warning: its
+    // bridge would be dead, and every call through it would answer zero
+    // without a word. A method that cannot be called from C does not count:
+    // the call answers with a message, not with a value.
+    let ffi_langs: HashSet<String> = all_ffi_methods
+        .iter()
+        .filter(|m| m.is_exposed() && m.is_callable())
+        .map(|m| m.lang.clone())
+        .collect();
+    // Every method gets a unique C symbol.
+    assign_c_symbols(&mut all_ffi_methods);
+    // Overloads of the same name are told apart by a dispatch name.
+    disambiguate_overloads(&mut all_ffi_methods);
+    // The methods the bridge exposes. A method that cannot be reached at
+    // all has no prototype and no stub, so it takes over no symbol either.
+    let exposed: Vec<FfiMethod> = all_ffi_methods
+        .iter()
+        .filter(|m| m.is_exposed())
+        .cloned()
+        .collect();
+    // A generated stub must not take over a symbol that one of the user's
+    // own functions defines.
+    check_user_symbol_conflicts(&exposed, &files_by_lang, vfs)?;
+
+    // Check that no FFI stub takes over the name of a C library function.
+    // The library's symbols are a property of the target, so they are
+    // looked up by the build, and not baked into the compiler.
+    if !exposed.is_empty() {
+        emit_libc_conflict_check(&mut script, &exposed, target_win);
+    }
+
+    // The header that declares the FFI methods to the user's own C code.
+    // It is written into the build directory, next to the sources, so that
+    // a source file can include it with #include "jgl_ffi.h".
+    if !exposed.is_empty() {
+        script.push_str("# Write the header that declares the FFI methods\n");
+        push_heredoc(
+            &mut script,
+            "jgl_ffi.h",
+            "JGL_FFI_H_EOF",
+            &ffi_header_source(&exposed),
+            "",
+        );
+        script.push_str("\n");
+        // The header is kept next to the binary right away, so that a build
+        // that fails later still shows the prototypes of the methods.
+        script.push_str("cp jgl_ffi.h ../jgl_ffi.h 2>/dev/null || true\n");
     }
     
     // Collect all .o files for final linking
@@ -267,7 +366,7 @@ script.push_str("fi\n\n");
                 let out_name = f.replace(".c", ".o");
                 object_files.push(out_name.clone());
                 native_objects.push(out_name.clone());
-                script.push_str(&format!("if [ -n \"${{CC:-}}\" ]; then $CC -O2 -c -o {} {} || echo \"Warning: Failed to compile {}\"; fi\n", sh_quote(&out_name), sh_quote(f), sh_quote(f)));
+                script.push_str(&format!("if [ -n \"${{CC:-}}\" ]; then $CC -O2 -c -o {} {} || {{ echo \"error: the C source {} did not compile\" >&2; exit 1; }}; fi\n", sh_quote(&out_name), sh_quote(f), sh_quote(f)));
             }
             script.push_str("\n");
         }
@@ -414,10 +513,10 @@ script.push_str("fi\n\n");
             for f in files {
                 script.push_str(&format!("{} ", sh_quote(f)));
             }
-            script.push_str("2>&1 || echo \"Warning: Failed to compile Java\"\n");
+            script.push_str(&compile_failure_step(ffi_langs.contains("java"), "Java"));
             script.push_str("    jar cf jgl_java.jar -C classes . 2>/dev/null || true\n");
             script.push_str("else\n");
-            script.push_str("    echo \"Warning: Java compiler (javac) not found, skipping Java compilation\"\n");
+            script.push_str(&missing_compiler_step(ffi_langs.contains("java"), "Java", "javac"));
             script.push_str("fi\n\n");
         }
     }
@@ -433,10 +532,14 @@ script.push_str("fi\n\n");
             for f in files {
                 script.push_str(&format!("{} ", sh_quote(f)));
             }
-            script.push_str("2>&1 || echo \"Warning: Failed to compile Kotlin\"\n");
+            script.push_str(&compile_failure_step(ffi_langs.contains("kt"), "Kotlin"));
             script.push_str("    jar cf jgl_kotlin.jar -C classes . 2>/dev/null || true\n");
             script.push_str("else\n");
-            script.push_str("    echo \"Warning: Kotlin compiler (kotlinc) not found, skipping Kotlin compilation\"\n");
+            script.push_str(&missing_compiler_step(
+                ffi_langs.contains("kt"),
+                "Kotlin",
+                "kotlinc",
+            ));
             script.push_str("fi\n\n");
         }
     }
@@ -451,9 +554,16 @@ script.push_str("fi\n\n");
             for f in files {
                 script.push_str(&format!("{} ", sh_quote(f)));
             }
-            script.push_str("-d jgl_scala.jar 2>&1 || echo \"Warning: Failed to compile Scala\"\n");
+            script.push_str(&format!(
+                "-d jgl_scala.jar {}",
+                compile_failure_step(ffi_langs.contains("scala"), "Scala")
+            ));
             script.push_str("else\n");
-            script.push_str("    echo \"Warning: Scala compiler (scalac) not found, skipping Scala compilation\"\n");
+            script.push_str(&missing_compiler_step(
+                ffi_langs.contains("scala"),
+                "Scala",
+                "scalac",
+            ));
             script.push_str("fi\n\n");
         }
     }
@@ -468,7 +578,10 @@ script.push_str("fi\n\n");
             for f in files {
                 script.push_str(&format!("{} ", sh_quote(f)));
             }
-            script.push_str("-out:jgl_cs.dll 2>&1 || echo \"Warning: Failed to compile C#\"\n");
+            script.push_str(&format!(
+                "-out:jgl_cs.dll {}",
+                compile_failure_step(ffi_langs.contains("cs"), "C#")
+            ));
             script.push_str("elif command -v dotnet &> /dev/null; then\n");
             script.push_str("    mkdir -p jgl_cs_proj\n");
             for f in files {
@@ -483,10 +596,17 @@ script.push_str("fi\n\n");
             script.push_str("  </PropertyGroup>\n");
             script.push_str("</Project>\n");
             script.push_str("CSPROJ_EOF\n");
-            script.push_str("    dotnet build jgl_cs_proj -c Release 2>&1 || echo \"Warning: Failed to compile C# with dotnet\"\n");
+            script.push_str(&format!(
+                "    dotnet build jgl_cs_proj -c Release {}",
+                compile_failure_step(ffi_langs.contains("cs"), "C#")
+            ));
             script.push_str("    cp jgl_cs_proj/bin/Release/net10.0/jgl_cs.dll jgl_cs.dll 2>/dev/null || cp jgl_cs_proj/bin/Release/net6.0/jgl_cs.dll jgl_cs.dll 2>/dev/null || true\n");
             script.push_str("else\n");
-            script.push_str("    echo \"Warning: C# compiler (csc) or dotnet not found, skipping C# compilation\"\n");
+            script.push_str(&missing_compiler_step(
+                ffi_langs.contains("cs"),
+                "C#",
+                "csc or dotnet",
+            ));
             script.push_str("fi\n\n");
         }
     }
@@ -502,10 +622,11 @@ script.push_str("fi\n\n");
         script.push_str("# Prefer bun for speed, fall back to npx tsc\n");
         script.push_str("for tsf in *.ts; do\n");
         script.push_str("    [ -f \"$tsf\" ] || continue\n");
+        script.push_str("    js_out=\"${tsf%.ts}.jgl.js\"\n");
         script.push_str("    if command -v bun &> /dev/null; then\n");
-        script.push_str("        bun build \"$tsf\" --outdir /tmp/ts_out --format cjs 2>/dev/null && cp /tmp/ts_out/$(basename \"${tsf%.ts}\").js \"${tsf%.ts}.js\" 2>/dev/null || true\n");
+        script.push_str("        bun build \"$tsf\" --outdir /tmp/ts_out --format cjs 2>/dev/null && cp /tmp/ts_out/$(basename \"${tsf%.ts}\").js \"$js_out\" 2>/dev/null || true\n");
         script.push_str("    elif command -v npx &> /dev/null; then\n");
-        script.push_str("        npx --yes tsc --module commonjs --target es2020 --outDir /tmp/ts_out \"$tsf\" 2>/dev/null && cp /tmp/ts_out/$(basename \"$tsf\" .ts).js \"${tsf%.ts}.js\" 2>/dev/null || true\n");
+        script.push_str("        npx --yes tsc --module commonjs --target es2020 --outDir /tmp/ts_out \"$tsf\" 2>/dev/null && cp /tmp/ts_out/$(basename \"$tsf\" .ts).js \"$js_out\" 2>/dev/null || true\n");
         script.push_str("    fi\n");
         script.push_str("done\n\n");
     }
@@ -557,313 +678,293 @@ script.push_str("fi\n\n");
         script.push_str("fi\n\n");
     }
     
-    // Generate FFI bridges for JVM and .NET languages
-    // C code declares extern functions (e.g. extern double java_mod(...)) that correspond
-    // to Java/C# static methods. We generate C wrapper stubs that call the runtime via subprocess.
+    // Generate FFI bridges for every language that exposes methods.
+    // The C code declares extern functions (e.g. extern double f(double))
+    // that correspond to the methods the sources really declare. Each bridge
+    // is a C wrapper that calls the runtime via a subprocess.
+    //
+    // The method list is derived from the parsed source files, so any number
+    // of methods, files, parameters and return types is supported.
+    // The methods the FFI bridges expose were collected before the
+    // compilation steps, so that a name conflict is reported before
+    // anything is built.
+    // The marker the bridges write in front of the value they return. It
+    // carries a nonce that is different in every build, so that a target
+    // cannot put the marker into its own output.
+    let marker = result_marker();
     let has_java = files_by_lang.contains_key("java");
     let has_kotlin = files_by_lang.contains_key("kt");
     let has_scala = files_by_lang.contains_key("scala");
     let has_cs = files_by_lang.contains_key("cs");
     let has_jvm = has_java || has_kotlin || has_scala;
-    
-    if has_jvm {
-        script.push_str("# Generate FFI bridge for JVM languages\n");
-        script.push_str("# Creates C wrapper functions that call Java methods via subprocess\n");
-        if target_win {
-            script.push_str("if command -v x86_64-w64-mingw32-gcc &> /dev/null || command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
-            script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then SCRIPT_CC=x86_64-w64-mingw32-gcc; elif command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
-        } else {
-            script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
-            script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
-        }
-        script.push_str("    if [ -f jgl_java.jar ] && command -v javac &> /dev/null; then\n");
-        script.push_str("        cat > JglJavaBridge.java << 'JAVA_BRIDGE'\n");
-        script.push_str("import java.lang.reflect.*;\n");
-        script.push_str("public class JglJavaBridge {\n");
-        script.push_str("    public static void main(String[] args) throws Exception {\n");
-        script.push_str("        Class<?> cls = Class.forName(args[0]);\n");
-        script.push_str("        Method m = cls.getMethod(args[1], double.class, double.class);\n");
-        script.push_str("        Object r = m.invoke(null, Double.valueOf(args[2]), Double.valueOf(args[3]));\n");
-        script.push_str("        System.out.println(r);\n");
-        script.push_str("    }\n");
-        script.push_str("}\n");
-        script.push_str("JAVA_BRIDGE\n");
-        script.push_str("        javac -d classes JglJavaBridge.java 2>/dev/null && jar uf jgl_java.jar -C classes JglJavaBridge.class 2>/dev/null || true\n");
-        script.push_str("        echo '/* FFI bridge for Java methods */' > ffi_jgl_java.c\n");
-        script.push_str("        echo '#define _GNU_SOURCE' >> ffi_jgl_java.c\n");
-        script.push_str("        echo '#include <stdio.h>' >> ffi_jgl_java.c\n");
-        script.push_str("        echo '#include <stdlib.h>' >> ffi_jgl_java.c\n");
-        script.push_str("        echo '#include <stdint.h>' >> ffi_jgl_java.c\n");
-        // Scan only user .java files (exclude JglJavaBridge.java)
-        script.push_str("        for jf in *.java; do\n");
-        script.push_str("            [ \"$jf\" = \"JglJavaBridge.java\" ] && continue\n");
-        script.push_str("            [ -f \"$jf\" ] || continue\n");
-        script.push_str("            cls=$(echo \"$jf\" | sed 's/\\.java$//')\n");
-        script.push_str("            methods=$(grep -oP 'public\\s+static\\s+double\\s+\\w+\\s*\\(' \"$jf\" | sed 's/.*double\\s\\+\\(\\w\\+\\)\\s*(/\\1/' || true)\n");
-        script.push_str("            for method in $methods; do\n");
-        script.push_str("                [ -n \"$method\" ] || continue\n");
-        script.push_str("                cat >> ffi_jgl_java.c << C_FUNC\n");
-        script.push_str("extern const unsigned char jgl_java_jar_data[]; extern const uint32_t jgl_java_jar_len;\n");
-        script.push_str("double ${method}(double a, double b) {\n");
-        script.push_str("    FILE *tf = fopen(\"/tmp/_jgl_jvm_jgl_java.jar\", \"wb\");\n");
-        script.push_str("    if (tf) { fwrite(jgl_java_jar_data, 1, jgl_java_jar_len, tf); fclose(tf); }\n");
-        script.push_str("    char cmd[1024];\n");
-        script.push_str("    snprintf(cmd, sizeof(cmd), \"java -cp /tmp/_jgl_jvm_jgl_java.jar JglJavaBridge %s %s %.17g %.17g\", \"${cls}\", \"${method}\", a, b);\n");
-        script.push_str("    FILE *p = popen(cmd, \"r\");\n");
-        script.push_str("    double result = 0.0;\n");
-        script.push_str("    if (p) { fscanf(p, \"%lf\", &result); pclose(p); }\n");
-        script.push_str("    return result;\n");
-        script.push_str("}\n");
-        script.push_str("C_FUNC\n");
-        script.push_str("            done\n");
-        script.push_str("        done\n");
-        script.push_str("        $SCRIPT_CC -c -O2 -o ffi_jgl_java.o ffi_jgl_java.c 2>&1 || echo \"Warning: Failed to compile Java FFI bridge\"\n");
-        script.push_str("        if [ -f ffi_jgl_java.o ]; then\n");
-        script.push_str("            NATIVE_OBJECTS=\"$NATIVE_OBJECTS ffi_jgl_java.o\"\n");
-        script.push_str("        fi\n");
-        script.push_str("    fi\n");
-        script.push_str("fi\n\n");
-    }
-    
-    if has_cs {
-        script.push_str("# Generate FFI bridge for C#\n");
-        if target_win {
-            script.push_str("if command -v x86_64-w64-mingw32-gcc &> /dev/null || command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
-            script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then SCRIPT_CC=x86_64-w64-mingw32-gcc; elif command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
-        } else {
-            script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
-            script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
-        }
-        script.push_str("    if [ -f jgl_cs.dll ]; then\n");
-        // Generate C# console bridge that uses reflection
-        script.push_str("        mkdir -p jgl_cs_runner\n");
-        script.push_str("        cat > jgl_cs_runner/JglCsBridge.cs << 'CS_BRIDGE'\n");
-        script.push_str("using System;\n");
-        script.push_str("using System.Linq;\n");
-        script.push_str("using System.Reflection;\n");
-        script.push_str("public class JglCsBridge {\n");
-        script.push_str("    public static void Main(string[] args) {\n");
-        script.push_str("        try {\n");
-        script.push_str("            Assembly asm = Assembly.LoadFrom(args[0]);\n");
-        script.push_str("            Type cls = asm.GetType(args[1]) ?? asm.GetTypes().First(t => t.Name == args[1]);\n");
-        script.push_str("            MethodInfo m = cls.GetMethod(args[2], new Type[] { typeof(double), typeof(double) });\n");
-        script.push_str("            object r = m.Invoke(null, new object[] { double.Parse(args[3]), double.Parse(args[4]) });\n");
-        script.push_str("            Console.WriteLine(r);\n");
-        script.push_str("        } catch (Exception e) {\n");
-        script.push_str("            Console.Error.WriteLine(e);\n");
-        script.push_str("            Environment.Exit(1);\n");
-        script.push_str("        }\n");
-        script.push_str("    }\n");
-        script.push_str("}\n");
-        script.push_str("CS_BRIDGE\n");
-        script.push_str("        if command -v csc &> /dev/null; then\n");
-        script.push_str("            csc -target:exe -out:jgl_cs_runner.exe jgl_cs_runner/JglCsBridge.cs 2>&1 || true\n");
-        script.push_str("        elif command -v dotnet &> /dev/null; then\n");
-        script.push_str("            cat > jgl_cs_runner/jgl_cs_runner.csproj << 'CSPROJ_EOF'\n");
-        script.push_str("<Project Sdk=\"Microsoft.NET.Sdk\">\n");
-        script.push_str("  <PropertyGroup>\n");
-        script.push_str("    <TargetFramework>net10.0</TargetFramework>\n");
-        script.push_str("    <OutputType>Exe</OutputType>\n");
-        script.push_str("    <AssemblyName>jgl_cs_runner</AssemblyName>\n");
-        script.push_str("  </PropertyGroup>\n");
-        script.push_str("</Project>\n");
-        script.push_str("CSPROJ_EOF\n");
-        script.push_str("            dotnet build jgl_cs_runner -c Release 2>&1 || echo \"Warning: Failed to build C# FFI bridge\"\n");
-        script.push_str("        fi\n");
-        // Copy the runner DLL to a known name for embedding alongside the ops DLL
-        script.push_str("        for r in jgl_cs_runner/bin/Release/net10.0/jgl_cs_runner.dll jgl_cs_runner/bin/Release/net6.0/jgl_cs_runner.dll; do\n");
-        script.push_str("            if [ -f \"$r\" ]; then cp \"$r\" jgl_cs_bridge.dll 2>/dev/null; fi\n");
-        script.push_str("        done\n");
-        script.push_str("        for r in jgl_cs_runner.exe jgl_cs_runner/jgl_cs_runner; do\n");
-        script.push_str("            [ -f \"$r\" ] && cp \"$r\" jgl_cs_bridge.dll 2>/dev/null || true\n");
-        script.push_str("        done\n");
-        script.push_str("        # Also copy runtimeconfig.json alongside the runner DLL for embedding\n");
-        script.push_str("        for r in jgl_cs_runner/bin/Release/net10.0/jgl_cs_runner.runtimeconfig.json jgl_cs_runner/bin/Release/net6.0/jgl_cs_runner.runtimeconfig.json; do\n");
-        script.push_str("            if [ -f \"$r\" ]; then cp \"$r\" jgl_cs_bridge.runtimeconfig.json 2>/dev/null; fi\n");
-        script.push_str("        done\n");
-        // Generate C FFI stubs for each public static double method in C# files
-        script.push_str("        echo '/* FFI bridge for C# methods */' > ffi_jgl_cs.c\n");
-        script.push_str("        echo '#define _GNU_SOURCE' >> ffi_jgl_cs.c\n");
-        script.push_str("        echo '#include <stdio.h>' >> ffi_jgl_cs.c\n");
-        script.push_str("        echo '#include <stdlib.h>' >> ffi_jgl_cs.c\n");
-        script.push_str("        echo '#include <string.h>' >> ffi_jgl_cs.c\n");
-        script.push_str("        echo '#include <stdint.h>' >> ffi_jgl_cs.c\n");
-        script.push_str("        echo 'extern const unsigned char jgl_cs_dll_data[]; extern const uint32_t jgl_cs_dll_len;' >> ffi_jgl_cs.c\n");
-        script.push_str("        echo 'extern const unsigned char jgl_cs_bridge_dll_data[]; extern const uint32_t jgl_cs_bridge_dll_len;' >> ffi_jgl_cs.c\n");
-        script.push_str("        echo 'extern const unsigned char jgl_cs_bridge_runtimeconfig_json_data[]; extern const uint32_t jgl_cs_bridge_runtimeconfig_json_len;' >> ffi_jgl_cs.c\n");
-        script.push_str("        for csf in *.cs; do\n");
-        script.push_str("            [ \"$csf\" = \"JglCsBridge.cs\" ] && continue\n");
-        script.push_str("            [ -f \"$csf\" ] || continue\n");
-            script.push_str("            cls=$(grep -oP 'class\\s+\\w+' \"$csf\" | head -1 | sed 's/.*class[[:space:]]\\+//')\n");
-        script.push_str("            methods=$(grep -oP 'public\\s+static\\s+double\\s+\\w+\\s*\\(' \"$csf\" | sed 's/.*double\\s\\+\\(\\w\\+\\)\\s*(/\\1/' || true)\n");
-        script.push_str("            for method in $methods; do\n");
-        script.push_str("                [ -n \"$method\" ] || continue\n");
-        script.push_str("                cat >> ffi_jgl_cs.c << C_FUNC\n");
-        script.push_str("double ${method}(double a, double b) {\n");
-        script.push_str("    FILE *tf = fopen(\"/tmp/_jgl_jvm_jgl_cs.dll\", \"wb\");\n");
-        script.push_str("    if (tf) { fwrite(jgl_cs_dll_data, 1, jgl_cs_dll_len, tf); fclose(tf); }\n");
-        script.push_str("    FILE *bf = fopen(\"/tmp/_jgl_cs_bridge.dll\", \"wb\");\n");
-        script.push_str("    if (bf) { fwrite(jgl_cs_bridge_dll_data, 1, jgl_cs_bridge_dll_len, bf); fclose(bf); }\n");
-        script.push_str("    FILE *rf = fopen(\"/tmp/_jgl_cs_bridge.runtimeconfig.json\", \"w\");\n");
-        script.push_str("    if (rf) { fwrite(jgl_cs_bridge_runtimeconfig_json_data, 1, jgl_cs_bridge_runtimeconfig_json_len, rf); fclose(rf); }\n");
-        script.push_str("    char cmd[1024];\n");
-        script.push_str("    snprintf(cmd, sizeof(cmd), \"dotnet /tmp/_jgl_cs_bridge.dll /tmp/_jgl_jvm_jgl_cs.dll %s %s %.17g %.17g 2>/dev/null\", \"${cls}\", \"${method}\", a, b);\n");
-        script.push_str("    FILE *p = popen(cmd, \"r\");\n");
-        script.push_str("    double result = 0.0;\n");
-        script.push_str("    if (p) { fscanf(p, \"%lf\", &result); pclose(p); }\n");
-        script.push_str("    return result;\n");
-        script.push_str("}\n");
-        script.push_str("C_FUNC\n");
-        script.push_str("            done\n");
-        script.push_str("        done\n");
-        script.push_str("        $SCRIPT_CC -c -O2 -o ffi_jgl_cs.o ffi_jgl_cs.c 2>&1 || echo \"Warning: Failed to compile C# FFI bridge\"\n");
-        script.push_str("        if [ -f ffi_jgl_cs.o ]; then\n");
-        script.push_str("            NATIVE_OBJECTS=\"$NATIVE_OBJECTS ffi_jgl_cs.o\"\n");
-        script.push_str("        fi\n");
-        script.push_str("    fi\n");
-        script.push_str("fi\n\n");
-    }
-
-    // FFI bridges for embedded scripting languages (Python, Lua, TypeScript)
-    // These languages run in a subprocess — the embedded source is written to a
-    // temp file at runtime, the interpreter is invoked with the input as an
-    // argument, and the result is read from stdout.
     let has_py = files_by_lang.contains_key("py");
     let has_lua = files_by_lang.contains_key("lua");
     let has_ts = files_by_lang.contains_key("ts");
+    let has_js = files_by_lang.contains_key("js");
 
-    if has_py {
-        script.push_str("# Generate FFI bridge for Python\n");
-        script.push_str("# Python runtimes are NOT bundled - declared as a runtime dependency\n");
-        if target_win {
-            script.push_str("if command -v x86_64-w64-mingw32-gcc &> /dev/null || command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
-            script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then SCRIPT_CC=x86_64-w64-mingw32-gcc; elif command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
-        } else {
-            script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
-            script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+    if has_jvm {
+        // Group the JVM methods by the class they belong to.
+        let mut jvm_jars: Vec<String> = Vec::new();
+        let mut jvm_classes: Vec<JvmClass> = Vec::new();
+        for (lang, jar_file, jar_symbol) in JVM_LANGS.iter() {
+            let lang_methods: Vec<&FfiMethod> = exposed
+                .iter()
+                .filter(|m| m.lang == *lang)
+                .collect();
+            if !lang_methods.is_empty() && !jvm_jars.contains(&jar_file.to_string()) {
+                jvm_jars.push(jar_file.to_string());
+            }
+            for (class_name, methods) in group_by_class(&lang_methods) {
+                jvm_classes.push(JvmClass {
+                    class_name,
+                    methods,
+                    jar_file: jar_file.to_string(),
+                    jar_symbol: jar_symbol.to_string(),
+                });
+            }
         }
-        script.push_str("    echo '/* FFI bridge for Python methods */' > ffi_jgl_python.c\n");
-        script.push_str("    echo '#define _GNU_SOURCE' >> ffi_jgl_python.c\n");
-        script.push_str("    echo '#include <stdio.h>' >> ffi_jgl_python.c\n");
-        script.push_str("    echo '#include <stdlib.h>' >> ffi_jgl_python.c\n");
-        script.push_str("    echo '#include <string.h>' >> ffi_jgl_python.c\n");
-        script.push_str("    echo '#include <stdint.h>' >> ffi_jgl_python.c\n");
-        script.push_str("    for pyf in *.py; do\n");
-        script.push_str("        [ -f \"$pyf\" ] || continue\n");
-        script.push_str("        var_name=$(echo \"$pyf\" | tr '.' '_')\n");
-        script.push_str("        echo \"extern const unsigned char ${var_name}_data[]; extern const uint32_t ${var_name}_len;\" >> ffi_jgl_python.c\n");
-        script.push_str("        methods=$(grep -oP 'def\\s+\\w+\\s*\\(' \"$pyf\" | sed 's/def\\s\\+\\(\\w\\+\\)\\s*(/\\1/' || true)\n");
-        script.push_str("        for method in $methods; do\n");
-        script.push_str("            cat >> ffi_jgl_python.c << PY_FUNC\n");
-        script.push_str("double ${method}(double a) {\n");
-        script.push_str("    FILE *tf = fopen(\"/tmp/_jgl_py_${method}.py\", \"w\");\n");
-        script.push_str("    if (tf) { fwrite(${var_name}_data, 1, ${var_name}_len, tf); fclose(tf); }\n");
-        script.push_str("    char cmd[1024];\n");
-        script.push_str("    snprintf(cmd, sizeof(cmd), \"python3 -c \\\"import sys; exec(open('/tmp/_jgl_py_${method}.py').read()); print(${method}(float(sys.argv[1])))\\\" %.17g 2>/dev/null\", a);\n");
-        script.push_str("    FILE *p = popen(cmd, \"r\");\n");
-        script.push_str("    double result = 0.0;\n");
-        script.push_str("    if (p) { fscanf(p, \"%lf\", &result); pclose(p); }\n");
-        script.push_str("    return result;\n");
-        script.push_str("}\n");
-        script.push_str("PY_FUNC\n");
-        script.push_str("        done\n");
-        script.push_str("    done\n");
-        script.push_str("    $SCRIPT_CC -c -O2 -o ffi_jgl_python.o ffi_jgl_python.c 2>&1 || echo \"Warning: Failed to compile Python FFI bridge\"\n");
-        script.push_str("    if [ -f ffi_jgl_python.o ]; then\n");
-        script.push_str("        NATIVE_OBJECTS=\"$NATIVE_OBJECTS ffi_jgl_python.o\"\n");
-        script.push_str("    fi\n");
-        script.push_str("fi\n\n");
+        if !jvm_classes.is_empty() {
+            // The bridge of a language whose compiler is missing still
+            // refers to its jar, so an empty jar keeps the link whole.
+            // The call then answers that the class is not there.
+            for jar in &jvm_jars {
+                script.push_str(&format!("[ -f {jar} ] || : > {jar}\n", jar = jar));
+            }
+            script.push_str("# Generate FFI bridge for JVM languages\n");
+            script.push_str("# Creates C wrapper functions that call Java/Kotlin/Scala methods via subprocess\n");
+            if target_win {
+                script.push_str("if command -v x86_64-w64-mingw32-gcc &> /dev/null || command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+                script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then SCRIPT_CC=x86_64-w64-mingw32-gcc; elif command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+            } else {
+                script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+                script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+            }
+            script.push_str("    if command -v javac &> /dev/null; then\n");
+            push_heredoc(
+                &mut script,
+                "JglJavaBridge.java",
+                "JAVA_BRIDGE",
+                &jvm_bridge_source(&jvm_classes, &marker),
+                "        ",
+            );
+            script.push_str("        javac -d classes JglJavaBridge.java 2>/dev/null || true\n");
+            script.push_str("        for jvm_jar in jgl_java.jar jgl_kotlin.jar jgl_scala.jar; do\n");
+            script.push_str("            if [ -f \"$jvm_jar\" ]; then jar uf \"$jvm_jar\" -C classes JglJavaBridge.class 2>/dev/null || true; fi\n");
+            script.push_str("        done\n");
+            // The C stubs are derived from the parsed method signatures.
+            push_heredoc(
+                &mut script,
+                "ffi_jgl_java.c",
+                "JGL_C_EOF",
+                &jvm_c_stub_source(&jvm_classes, &marker),
+                "        ",
+            );
+            script.push_str("        $SCRIPT_CC -c -O2 -o ffi_jgl_java.o ffi_jgl_java.c 2>&1 || echo \"Warning: Failed to compile Java FFI bridge\"\n");
+            script.push_str("        if [ -f ffi_jgl_java.o ]; then\n");
+            script.push_str("            NATIVE_OBJECTS=\"$NATIVE_OBJECTS ffi_jgl_java.o\"\n");
+            script.push_str("        fi\n");
+            script.push_str("    fi\n");
+            script.push_str("fi\n\n");
+        }
+    }
+
+    if has_cs {
+        // Group the C# methods by the class they belong to.
+        let cs_methods: Vec<&FfiMethod> = exposed
+            .iter()
+            .filter(|m| m.lang == "cs")
+            .collect();
+        let cs_classes = group_by_class(&cs_methods);
+        if !cs_classes.is_empty() {
+            script.push_str("# Generate FFI bridge for C#\n");
+            if target_win {
+                script.push_str("if command -v x86_64-w64-mingw32-gcc &> /dev/null || command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+                script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then SCRIPT_CC=x86_64-w64-mingw32-gcc; elif command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+            } else {
+                script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+                script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+            }
+            script.push_str("    if [ -f jgl_cs.dll ]; then\n");
+            // Generate C# console bridge that uses reflection
+            script.push_str("        mkdir -p jgl_cs_runner\n");
+            push_heredoc(
+                &mut script,
+                "jgl_cs_runner/JglCsBridge.cs",
+                "CS_BRIDGE",
+                &cs_bridge_source(&cs_classes, &marker),
+                "        ",
+            );
+            script.push_str("        if command -v csc &> /dev/null; then\n");
+            script.push_str("            csc -target:exe -out:jgl_cs_runner.exe jgl_cs_runner/JglCsBridge.cs 2>&1 || true\n");
+            script.push_str("        elif command -v dotnet &> /dev/null; then\n");
+            script.push_str("            cat > jgl_cs_runner/jgl_cs_runner.csproj << 'CSPROJ_EOF'\n");
+            script.push_str("<Project Sdk=\"Microsoft.NET.Sdk\">\n");
+            script.push_str("  <PropertyGroup>\n");
+            script.push_str("    <TargetFramework>net10.0</TargetFramework>\n");
+            script.push_str("    <OutputType>Exe</OutputType>\n");
+            script.push_str("    <AssemblyName>jgl_cs_runner</AssemblyName>\n");
+            script.push_str("  </PropertyGroup>\n");
+            script.push_str("</Project>\n");
+            script.push_str("CSPROJ_EOF\n");
+            script.push_str("            dotnet build jgl_cs_runner -c Release 2>&1 || echo \"Warning: Failed to build C# FFI bridge\"\n");
+            script.push_str("        fi\n");
+            // Copy the runner DLL to a known name for embedding alongside the ops DLL
+            script.push_str("        for r in jgl_cs_runner/bin/Release/net10.0/jgl_cs_runner.dll jgl_cs_runner/bin/Release/net6.0/jgl_cs_runner.dll; do\n");
+            script.push_str("            if [ -f \"$r\" ]; then cp \"$r\" jgl_cs_bridge.dll 2>/dev/null; fi\n");
+            script.push_str("        done\n");
+            script.push_str("        for r in jgl_cs_runner.exe jgl_cs_runner/jgl_cs_runner; do\n");
+            script.push_str("            [ -f \"$r\" ] && cp \"$r\" jgl_cs_bridge.dll 2>/dev/null || true\n");
+            script.push_str("        done\n");
+            script.push_str("        # Also copy runtimeconfig.json alongside the runner DLL for embedding\n");
+            script.push_str("        for r in jgl_cs_runner/bin/Release/net10.0/jgl_cs_runner.runtimeconfig.json jgl_cs_runner/bin/Release/net6.0/jgl_cs_runner.runtimeconfig.json; do\n");
+            script.push_str("            if [ -f \"$r\" ]; then cp \"$r\" jgl_cs_bridge.runtimeconfig.json 2>/dev/null; fi\n");
+            script.push_str("        done\n");
+            push_heredoc(
+                &mut script,
+                "ffi_jgl_cs.c",
+                "JGL_C_EOF",
+                &cs_c_stub_source(&cs_classes, &marker),
+                "        ",
+            );
+            script.push_str("        $SCRIPT_CC -c -O2 -o ffi_jgl_cs.o ffi_jgl_cs.c 2>&1 || echo \"Warning: Failed to compile C# FFI bridge\"\n");
+            script.push_str("        if [ -f ffi_jgl_cs.o ]; then\n");
+            script.push_str("            NATIVE_OBJECTS=\"$NATIVE_OBJECTS ffi_jgl_cs.o\"\n");
+            script.push_str("        fi\n");
+            script.push_str("    fi\n");
+            script.push_str("fi\n\n");
+        }
+    }
+
+    // FFI bridges for embedded scripting languages (Python, Lua, TypeScript,
+    // JavaScript). These languages run in a subprocess — the embedded source
+    // is written to a temp file at runtime, the interpreter is invoked with
+    // the input as an argument, and the result is read from stdout.
+    if has_py {
+        let py_methods: Vec<&FfiMethod> = exposed
+            .iter()
+            .filter(|m| m.lang == "py")
+            .collect();
+        if !py_methods.is_empty() {
+            script.push_str("# Generate FFI bridge for Python\n");
+            script.push_str("# Python runtimes are NOT bundled - declared as a runtime dependency\n");
+            if target_win {
+                script.push_str("if command -v x86_64-w64-mingw32-gcc &> /dev/null || command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+                script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then SCRIPT_CC=x86_64-w64-mingw32-gcc; elif command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+            } else {
+                script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+                script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+            }
+            script.push_str("    if command -v python3 &> /dev/null; then\n");
+            push_heredoc(
+                &mut script,
+                "ffi_jgl_python.c",
+                "JGL_C_EOF",
+                &py_c_stub_source(&py_methods, &marker),
+                "    ",
+            );
+            script.push_str("    $SCRIPT_CC -c -O2 -o ffi_jgl_python.o ffi_jgl_python.c 2>&1 || echo \"Warning: Failed to compile Python FFI bridge\"\n");
+            script.push_str("    if [ -f ffi_jgl_python.o ]; then\n");
+            script.push_str("        NATIVE_OBJECTS=\"$NATIVE_OBJECTS ffi_jgl_python.o\"\n");
+            script.push_str("    fi\n");
+            script.push_str("    fi\n");
+            script.push_str("fi\n\n");
+        }
     }
 
     if has_lua {
-        script.push_str("# Generate FFI bridge for Lua\n");
-        script.push_str("# Lua runtimes are NOT bundled - declared as a runtime dependency\n");
-        if target_win {
-            script.push_str("if command -v x86_64-w64-mingw32-gcc &> /dev/null || command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
-            script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then SCRIPT_CC=x86_64-w64-mingw32-gcc; elif command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
-        } else {
-            script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
-            script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+        let lua_methods: Vec<&FfiMethod> = exposed
+            .iter()
+            .filter(|m| m.lang == "lua")
+            .collect();
+        if !lua_methods.is_empty() {
+            script.push_str("# Generate FFI bridge for Lua\n");
+            script.push_str("# Lua runtimes are NOT bundled - declared as a runtime dependency\n");
+            if target_win {
+                script.push_str("if command -v x86_64-w64-mingw32-gcc &> /dev/null || command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+                script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then SCRIPT_CC=x86_64-w64-mingw32-gcc; elif command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+            } else {
+                script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+                script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+            }
+            script.push_str("    if command -v lua &> /dev/null; then\n");
+            push_heredoc(
+                &mut script,
+                "ffi_jgl_lua.c",
+                "JGL_C_EOF",
+                &lua_c_stub_source(&lua_methods, &marker),
+                "    ",
+            );
+            script.push_str("    $SCRIPT_CC -c -O2 -o ffi_jgl_lua.o ffi_jgl_lua.c 2>&1 || echo \"Warning: Failed to compile Lua FFI bridge\"\n");
+            script.push_str("    if [ -f ffi_jgl_lua.o ]; then\n");
+            script.push_str("        NATIVE_OBJECTS=\"$NATIVE_OBJECTS ffi_jgl_lua.o\"\n");
+            script.push_str("    fi\n");
+            script.push_str("    fi\n");
+            script.push_str("fi\n\n");
         }
-        script.push_str("    echo '/* FFI bridge for Lua methods */' > ffi_jgl_lua.c\n");
-        script.push_str("    echo '#define _GNU_SOURCE' >> ffi_jgl_lua.c\n");
-        script.push_str("    echo '#include <stdio.h>' >> ffi_jgl_lua.c\n");
-        script.push_str("    echo '#include <stdlib.h>' >> ffi_jgl_lua.c\n");
-        script.push_str("    echo '#include <string.h>' >> ffi_jgl_lua.c\n");
-        script.push_str("    echo '#include <stdint.h>' >> ffi_jgl_lua.c\n");
-        script.push_str("    for luf in *.lua; do\n");
-        script.push_str("        [ -f \"$luf\" ] || continue\n");
-        script.push_str("        var_name=$(echo \"$luf\" | tr '.' '_')\n");
-        script.push_str("        echo \"extern const unsigned char ${var_name}_data[]; extern const uint32_t ${var_name}_len;\" >> ffi_jgl_lua.c\n");
-        script.push_str("        methods=$(grep -oP 'function\\s+\\w+\\s*\\(' \"$luf\" | sed 's/function\\s\\+\\(\\w\\+\\)\\s*(/\\1/' || true)\n");
-        script.push_str("        for method in $methods; do\n");
-        script.push_str("            [ -n \"$method\" ] || continue\n");
-        script.push_str("            cat >> ffi_jgl_lua.c << LUA_FUNC\n");
-        script.push_str("double ${method}(double a) {\n");
-        script.push_str("    FILE *tf = fopen(\"/tmp/_jgl_lua_${method}.lua\", \"w\");\n");
-        script.push_str("    if (tf) { fwrite(${var_name}_data, 1, ${var_name}_len, tf); fclose(tf); }\n");
-        script.push_str("    char cmd[1024];\n");
-        script.push_str("    snprintf(cmd, sizeof(cmd), \"lua -e 'local a=%.17g; assert(loadfile(\\\"/tmp/_jgl_lua_${method}.lua\\\"))(); print(%s(a))' 2>/dev/null\", a, \"${method}\");\n");
-        script.push_str("    FILE *p = popen(cmd, \"r\");\n");
-        script.push_str("    double result = 0.0;\n");
-        script.push_str("    if (p) { fscanf(p, \"%lf\", &result); pclose(p); }\n");
-        script.push_str("    return result;\n");
-        script.push_str("}\n");
-        script.push_str("LUA_FUNC\n");
-        script.push_str("        done\n");
-        script.push_str("    done\n");
-        script.push_str("    $SCRIPT_CC -c -O2 -o ffi_jgl_lua.o ffi_jgl_lua.c 2>&1 || echo \"Warning: Failed to compile Lua FFI bridge\"\n");
-        script.push_str("    if [ -f ffi_jgl_lua.o ]; then\n");
-        script.push_str("        NATIVE_OBJECTS=\"$NATIVE_OBJECTS ffi_jgl_lua.o\"\n");
-        script.push_str("    fi\n");
-        script.push_str("fi\n\n");
     }
 
     if has_ts {
-        script.push_str("# Generate FFI bridge for TypeScript\n");
-        script.push_str("# TypeScript was precompiled to JS at build time; use node directly\n");
-        if target_win {
-            script.push_str("if command -v x86_64-w64-mingw32-gcc &> /dev/null || command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
-            script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then SCRIPT_CC=x86_64-w64-mingw32-gcc; elif command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
-        } else {
-            script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
-            script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+        let ts_methods: Vec<&FfiMethod> = exposed
+            .iter()
+            .filter(|m| m.lang == "ts")
+            .collect();
+        if !ts_methods.is_empty() {
+            script.push_str("# Generate FFI bridge for TypeScript\n");
+            script.push_str("# TypeScript was precompiled to JS at build time; use node directly\n");
+            if target_win {
+                script.push_str("if command -v x86_64-w64-mingw32-gcc &> /dev/null || command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+                script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then SCRIPT_CC=x86_64-w64-mingw32-gcc; elif command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+            } else {
+                script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+                script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+            }
+            script.push_str("    if command -v node &> /dev/null; then\n");
+            push_heredoc(
+                &mut script,
+                "ffi_jgl_ts.c",
+                "JGL_C_EOF",
+                &node_c_stub_source("ts", &ts_methods, &marker),
+                "    ",
+            );
+            script.push_str("    $SCRIPT_CC -c -O2 -o ffi_jgl_ts.o ffi_jgl_ts.c 2>&1 || echo \"Warning: Failed to compile TS FFI bridge\"\n");
+            script.push_str("    if [ -f ffi_jgl_ts.o ]; then\n");
+            script.push_str("        NATIVE_OBJECTS=\"$NATIVE_OBJECTS ffi_jgl_ts.o\"\n");
+            script.push_str("    fi\n");
+            script.push_str("    fi\n");
+            script.push_str("fi\n\n");
         }
-        script.push_str("    echo '/* FFI bridge for TypeScript */' > ffi_jgl_ts.c\n");
-        script.push_str("    echo '#define _GNU_SOURCE' >> ffi_jgl_ts.c\n");
-        script.push_str("    echo '#include <stdio.h>' >> ffi_jgl_ts.c\n");
-        script.push_str("    echo '#include <stdlib.h>' >> ffi_jgl_ts.c\n");
-        script.push_str("    echo '#include <string.h>' >> ffi_jgl_ts.c\n");
-        script.push_str("    echo '#include <stdint.h>' >> ffi_jgl_ts.c\n");
-        // Iterate .ts files, find their precompiled .js counterparts
-        script.push_str("    for tsf in *.ts; do\n");
-        script.push_str("        [ -f \"$tsf\" ] || continue\n");
-        script.push_str("        jsf=\"${tsf%.ts}.js\"\n");
-        script.push_str("        [ -f \"$jsf\" ] || continue\n");
-        script.push_str("        var_name=$(echo \"$jsf\" | tr '.' '_')\n");
-        script.push_str("        echo \"extern const unsigned char ${var_name}_data[]; extern const uint32_t ${var_name}_len;\" >> ffi_jgl_ts.c\n");
-        script.push_str("        methods=$(grep -oP '(?:export\\s+)?function\\s+\\w+\\s*\\(' \"$tsf\" | sed 's/.*function\\s\\+\\(\\w\\+\\)\\s*(/\\1/' || true)\n");
-        script.push_str("        for method in $methods; do\n");
-        script.push_str("            [ -n \"$method\" ] || continue\n");
-        script.push_str("            cat >> ffi_jgl_ts.c << TS_FUNC\n");
-        script.push_str("double ${method}(double a) {\n");
-        script.push_str("    FILE *tf = fopen(\"/tmp/_jgl_ts_${method}.js\", \"w\");\n");
-        script.push_str("    if (tf) { fwrite(${var_name}_data, 1, ${var_name}_len, tf); fclose(tf); }\n");
-        script.push_str("    char cmd[1024];\n");
-        script.push_str("    snprintf(cmd, sizeof(cmd), \"node -e \\\"const m = require('/tmp/_jgl_ts_${method}.js'); console.log(m.${method}(parseFloat(process.argv[1])))\\\" %.17g 2>/dev/null\", a);\n");
-        script.push_str("    FILE *p = popen(cmd, \"r\");\n");
-        script.push_str("    double result = 0.0;\n");
-        script.push_str("    if (p) { fscanf(p, \"%lf\", &result); pclose(p); }\n");
-        script.push_str("    return result;\n");
-        script.push_str("}\n");
-        script.push_str("TS_FUNC\n");
-        script.push_str("        done\n");
-        script.push_str("    done\n");
-        script.push_str("    $SCRIPT_CC -c -O2 -o ffi_jgl_ts.o ffi_jgl_ts.c 2>&1 || echo \"Warning: Failed to compile TS FFI bridge\"\n");
-        script.push_str("    if [ -f ffi_jgl_ts.o ]; then\n");
-        script.push_str("        NATIVE_OBJECTS=\"$NATIVE_OBJECTS ffi_jgl_ts.o\"\n");
-        script.push_str("    fi\n");
-        script.push_str("fi\n\n");
+    }
+
+    if has_js {
+        let js_methods: Vec<&FfiMethod> = exposed
+            .iter()
+            .filter(|m| m.lang == "js")
+            .collect();
+        if !js_methods.is_empty() {
+            script.push_str("# Generate FFI bridge for JavaScript\n");
+            script.push_str("# JavaScript runtimes are NOT bundled - declared as a runtime dependency\n");
+            if target_win {
+                script.push_str("if command -v x86_64-w64-mingw32-gcc &> /dev/null || command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+                script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then SCRIPT_CC=x86_64-w64-mingw32-gcc; elif command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+            } else {
+                script.push_str("if command -v cc &> /dev/null || command -v gcc &> /dev/null; then\n");
+                script.push_str("    if command -v cc &> /dev/null; then SCRIPT_CC=cc; else SCRIPT_CC=gcc; fi\n");
+            }
+            script.push_str("    if command -v node &> /dev/null; then\n");
+            push_heredoc(
+                &mut script,
+                "ffi_jgl_js.c",
+                "JGL_C_EOF",
+                &node_c_stub_source("js", &js_methods, &marker),
+                "    ",
+            );
+            script.push_str("    $SCRIPT_CC -c -O2 -o ffi_jgl_js.o ffi_jgl_js.c 2>&1 || echo \"Warning: Failed to compile JS FFI bridge\"\n");
+            script.push_str("    if [ -f ffi_jgl_js.o ]; then\n");
+            script.push_str("        NATIVE_OBJECTS=\"$NATIVE_OBJECTS ffi_jgl_js.o\"\n");
+            script.push_str("    fi\n");
+            script.push_str("    fi\n");
+            script.push_str("fi\n\n");
+        }
     }
 
     // Custom languages
@@ -987,10 +1088,10 @@ script.push_str("fi\n\n");
     if has_jvm {
         script.push_str("echo \"Java: JVM not bundled (requires java at runtime), JAR embedded in binary\"\n");
     }
-    script.push_str("if [ -f jgl_kotlin.jar ]; then\n");
+    script.push_str("if [ -s jgl_kotlin.jar ]; then\n");
     script.push_str("    echo \"Kotlin JAR: jgl_kotlin.jar (requires JVM at runtime)\"\n");
     script.push_str("fi\n");
-    script.push_str("if [ -f jgl_scala.jar ]; then\n");
+    script.push_str("if [ -s jgl_scala.jar ]; then\n");
     script.push_str("    echo \"Scala JAR: jgl_scala.jar (requires JVM at runtime)\"\n");
     script.push_str("fi\n");
     if has_cs {
@@ -1004,6 +1105,11 @@ script.push_str("fi\n\n");
     }
     if has_ts {
         script.push_str("echo \"TypeScript: requires node at runtime (interpreter not bundled, TS precompiled to JS)\"\n");
+    }
+    // The header is kept next to the binary, so that the user can include it
+    // from a source of their own.
+    if !exposed.is_empty() {
+        script.push_str("if [ -f jgl_ffi.h ]; then cp jgl_ffi.h ../jgl_ffi.h 2>/dev/null || true; fi\n");
     }
     let bin_name_final = if target_win { format!("{}.exe", bin_name) } else { bin_name.to_string() };
     script.push_str(&format!("if [ -f {} ]; then\n", bin_name_final));
@@ -1059,4 +1165,2970 @@ fn get_dependency_restore_cmd_unix(lang: &str) -> &'static str {
         _ => "",
     }
 }
+// ===== FFI Helper Functions =====
 
+/// The languages that get an FFI bridge, in a fixed order so that the
+/// generated symbols are deterministic.
+const FFI_LANGS: &[&str] = &["java", "kt", "scala", "cs", "py", "lua", "ts", "js"];
+
+/// JVM languages with the JAR they are compiled into and the C symbol of
+/// that embedded JAR: (language key, jar file, embedded payload symbol).
+const JVM_LANGS: &[(&str, &str, &str)] = &[
+    ("java", "jgl_java.jar", "jgl_java_jar"),
+    ("kt", "jgl_kotlin.jar", "jgl_kotlin_jar"),
+    ("scala", "jgl_scala.jar", "jgl_scala_jar"),
+];
+
+/// One method exposed through the FFI bridge.
+#[derive(Debug, Clone)]
+struct FfiMethod {
+    /// The language the method is written in.
+    lang: String,
+    /// The source file the method was parsed from.
+    file: String,
+    /// The class the method belongs to, when the language has classes.
+    class_name: Option<String>,
+    /// The C function symbol of the generated stub.
+    sym: String,
+    /// The parsed signature.
+    sig: MethodSig,
+    /// The name the bridge dispatches on. It is the method name, unless the
+    /// class declares the name more than once: then every overload gets a
+    /// name of its own, so that the bridge can tell them apart.
+    dispatch_name: String,
+    /// The number of the definition of the method among the definitions of
+    /// the same name in the same class, and how many there are. A name that
+    /// is declared more than once is shadowed by the later declaration, so
+    /// the earlier definitions have to be reached in another way.
+    definition_index: usize,
+    definition_count: usize,
+    /// The number of the definition of the method among the definitions of
+    /// the same name and of the same kind. The Python bridge tells the
+    /// definitions of a name apart by their kind, so the number it is given
+    /// is the number among those of its own kind.
+    kind_index: usize,
+    /// The kind of a Python method: "static", "class" or "instance". The
+    /// bridge reaches a shadowed definition through the definition the
+    /// module made of it, and only a static method and a class method are
+    /// among those.
+    py_kind: &'static str,
+    /// The method is not exposed through the bridge. The reason is told to
+    /// the user when the project is generated, and the method is left out
+    /// of the header.
+    skipped: Option<String>,
+}
+
+impl FfiMethod {
+    /// The method is exposed through the bridge: it has a symbol, a
+    /// prototype in the header and a stub.
+    fn is_exposed(&self) -> bool {
+        self.skipped.is_none()
+    }
+
+    /// The method can be called from C. A method of the JVM languages and
+    /// of C# that is not static needs an instance, and an instance cannot
+    /// be made from C.
+    fn is_callable(&self) -> bool {
+        let needs_instance = match self.lang.as_str() {
+            "java" | "kt" | "scala" | "cs" => self.sig.needs_instance,
+            _ => false,
+        };
+        !needs_instance && self.sig.not_callable.is_none()
+    }
+}
+
+/// A JVM class with its methods and the JAR it lives in.
+struct JvmClass<'a> {
+    class_name: String,
+    methods: Vec<&'a FfiMethod>,
+    jar_file: String,
+    jar_symbol: String,
+}
+
+/// The kind of value a method returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetKind {
+    Void,
+    Float,
+    Int,
+    Bool,
+    Text,
+}
+
+/// C helper that quotes a value so that the shell passes it through as one
+/// word.
+///
+/// The result is allocated, so that a value of any length survives. The
+/// caller frees it.
+const SHELL_QUOTE_HELPER: &str = r#"
+/* Quote a value so that the shell passes it through as one word. */
+static char *jgl_shquote(const char *s) {
+    size_t len = s ? strlen(s) : 0;
+    /* A quote inside the value needs four characters, plus the two quotes
+       around it and the terminator. */
+    char *out = (char *)malloc(len * 4 + 3);
+    if (!out) return NULL;
+    size_t n = 0;
+    out[n++] = '\'';
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] == '\'') { out[n++] = '\''; out[n++] = '\\'; out[n++] = '\''; out[n++] = '\''; }
+        else { out[n++] = s[i]; }
+    }
+    out[n++] = '\'';
+    out[n] = '\0';
+    return out;
+}
+"#;
+
+/// C helper that appends text to a buffer, growing the buffer when the text
+/// does not fit, and a helper that appends a word to a command line.
+const APPEND_HELPER: &str = r#"
+/* Append text to a buffer, growing the buffer when it does not fit. */
+static void jgl_add(char **buf, size_t *cap, const char *text) {
+    size_t len = strlen(*buf);
+    size_t need = len + strlen(text) + 1;
+    if (need > *cap) {
+        size_t ncap = *cap ? *cap : 1024;
+        char *grown;
+        while (ncap < need) ncap *= 2;
+        grown = (char *)realloc(*buf, ncap);
+        if (!grown) return;
+        *buf = grown;
+        *cap = ncap;
+    }
+    strcat(*buf, text);
+}
+
+/* Append a word to a buffer, with a space in front of it. */
+static void jgl_add_word(char **buf, size_t *cap, const char *word) {
+    if (**buf) jgl_add(buf, cap, " ");
+    jgl_add(buf, cap, word);
+}
+
+/* Append a word to a command line. */
+static void jgl_app(char **cmd, size_t *cap, const char *word, int quote) {
+    char *q = quote ? jgl_shquote(word) : NULL;
+    jgl_add_word(cmd, cap, q ? q : word);
+    if (q) free(q);
+}
+"#;
+
+/// C helper that escapes a value as a Lua double quoted string literal.
+///
+/// The result is allocated, so that a value of any length survives. The
+/// caller frees it.
+const LUA_QUOTE_HELPER: &str = r#"
+/* Escape a value as a Lua double quoted string literal. */
+static char *jgl_luaquote(const char *s) {
+    size_t len = s ? strlen(s) : 0;
+    /* Every character may need two characters, plus the two quotes and the
+       terminator. */
+    char *out = (char *)malloc(len * 2 + 3);
+    if (!out) return NULL;
+    size_t n = 0;
+    out[n++] = '"';
+    for (size_t i = 0; i < len; i++) {
+        char c = s[i];
+        if (c == '\\') { out[n++] = '\\'; out[n++] = '\\'; }
+        else if (c == '"') { out[n++] = '\\'; out[n++] = '"'; }
+        else if (c == '\n') { out[n++] = '\\'; out[n++] = 'n'; }
+        else if (c == '\r') { out[n++] = '\\'; out[n++] = 'r'; }
+        else if (c == '\t') { out[n++] = '\\'; out[n++] = 't'; }
+        else { out[n++] = c; }
+    }
+    out[n++] = '"';
+    out[n] = '\0';
+    return out;
+}
+"#;
+
+/// C helper that turns a flag into a Lua boolean literal.
+const LUA_BOOL_HELPER: &str = r#"
+/* Turn a flag into a Lua boolean literal. */
+static const char *jgl_luabool(int v) {
+    return v ? "true" : "false";
+}
+"#;
+
+/// C helper that returns the IEEE-754 bit pattern of a double.
+///
+/// A double travels to the other languages as the sixteen hexadecimal digits
+/// of its bit pattern, written most significant byte first. The pattern is
+/// exact, so every double survives the crossing, including the infinite
+/// ones, the not-a-numbers and the negative zero.
+const DOUBLE_BITS_HELPER: &str = r#"
+/* The IEEE-754 bit pattern of a double, most significant byte first. */
+static unsigned long long jgl_double_bits(double d) {
+    unsigned long long u = 0;
+    /* The bytes of the double are copied into an integer, which gives the
+       same pattern whatever the byte order of the machine is. The digits
+       are then written most significant byte first. */
+    memcpy(&u, &d, sizeof(u));
+    return u;
+}
+"#;
+
+/// The Lua helper that turns the hexadecimal digits of a double's bit pattern
+/// back into the double.
+///
+/// The value is rebuilt from its sign, its exponent and its mantissa, so that
+/// every double survives, including the infinite ones, the not-a-numbers and
+/// the negative zero.
+const LUA_DOUBLE_HELPER: &str = "local function jgl_hexdouble(s) local hi=tonumber(s:sub(1,8),16) local lo=tonumber(s:sub(9,16),16) local sg=1 if hi>=2147483648 then sg=-1 hi=hi-2147483648 end local e=math.floor(hi/1048576) local fr=(hi-e*1048576)*4294967296+lo if e==2047 then if fr==0 then return sg*math.huge end return 0.0/0.0 end if e==0 then return sg*(fr*2^-1074) end return sg*(1+fr*2^-52)*2^(e-1023) end; ";
+
+/// The Node helper that turns the hexadecimal digits of a double's bit pattern
+/// back into the double.
+const TS_DOUBLE_HELPER: &str = "function jglHexDouble(s){const d=new DataView(new ArrayBuffer(8));for(let i=0;i<8;i++)d.setUint8(i,parseInt(s.slice(i*2,i*2+2),16));return d.getFloat64(0,false);} ";
+
+/// Whether any of the methods takes a double, so that the bridge needs the
+/// helper that turns a double into its bit pattern.
+fn takes_double<'a>(methods: impl IntoIterator<Item = &'a FfiMethod>) -> bool {
+    methods
+        .into_iter()
+        .any(|m| m.sig.params.iter().any(|p| p.jgl_type == JglType::Double))
+}
+
+/// The stem of a source file: "ops.py" -> "ops".
+fn file_stem(path: &str) -> String {
+    Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+/// The class a method belongs to when the source declares no class around
+/// it. The JVM languages compile file level functions into a class named
+/// after the file.
+fn default_class_name(lang: &str, path: &str) -> Option<String> {
+    let stem = file_stem(path);
+    match lang {
+        "java" | "scala" => Some(stem),
+        "kt" => Some(format!("{}Kt", capitalize_ascii_only(&stem))),
+        "cs" => Some(stem),
+        _ => None,
+    }
+}
+
+/// The name with its first character in upper case. Kotlin compiles the
+/// file level functions of a file into a class named after the file, with
+/// the first character of the name in upper case: "mathy.kt" is compiled
+/// into "MathyKt" and "k.kt" into "KKt".
+fn capitalize_ascii_only(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// The kind of a Python method: "static", "class" or "instance".
+///
+/// The bridge reaches a definition that a later definition has shadowed
+/// through the definitions the module made of them, and only a static
+/// method and a class method are among those.
+fn py_kind(sig: &MethodSig) -> &'static str {
+    if sig.py.class_method {
+        "class"
+    } else if sig.py.static_method {
+        "static"
+    } else {
+        "instance"
+    }
+}
+
+/// Parse every source file of a language and collect the methods it exposes.
+fn collect_ffi_methods(
+    lang: &str,
+    files_by_lang: &HashMap<String, Vec<String>>,
+    vfs: &Vfs,
+) -> Vec<FfiMethod> {
+    let mut out: Vec<FfiMethod> = Vec::new();
+    let Some(files) = files_by_lang.get(lang) else {
+        return out;
+    };
+    for f in files {
+        let Some(entry) = vfs.get(f) else {
+            continue;
+        };
+        // A Lua function that is local to the file cannot be called from C.
+        // The user is told about it, so that the reason the symbol is not
+        // there is known.
+        if lang == "lua" {
+            for name in lua_local_functions(&entry.content) {
+                eprintln!(
+                    "jglc: warning: the Lua function \"{}\" in {} is local to the file and cannot be called from C; publish it in the table the module returns to expose it",
+                    name, f
+                );
+            }
+        }
+        // A file without a single parsable method contributes nothing: no
+        // stub with an invented signature is emitted for it.
+        let methods = parse_methods(lang, &entry.content);
+        if methods.is_empty() {
+            continue;
+        }
+        // The class a file level function is compiled into lives in the
+        // package the file declares.
+        let package = package_name(&entry.content, lang);
+        // A name that is declared more than once in the same class is
+        // shadowed by the later declaration.
+        let mut counts: HashMap<(String, String), usize> = HashMap::new();
+        for sig in &methods {
+            let key = (sig.qualifier.clone().unwrap_or_default(), sig.name.clone());
+            *counts.entry(key).or_insert(0) += 1;
+        }
+        let mut seen: HashMap<(String, String), usize> = HashMap::new();
+        // The number of the definition among the definitions of the same
+        // name and of the same kind. The bridge tells the definitions of a
+        // name apart by their kind, so it is given this number and not the
+        // one of all the definitions of the name.
+        let mut kind_seen: HashMap<(String, String, &'static str), usize> = HashMap::new();
+        for sig in methods {
+            let class_name = match &sig.qualifier {
+                Some(q) => Some(q.clone()),
+                None => default_class_name(lang, f).map(|c| match &package {
+                    Some(p) => format!("{}.{}", p, c),
+                    None => c,
+                }),
+            };
+            let key = (sig.qualifier.clone().unwrap_or_default(), sig.name.clone());
+            let count = counts.get(&key).copied().unwrap_or(0);
+            let index = {
+                let entry = seen.entry(key.clone()).or_insert(0);
+                *entry += 1;
+                *entry - 1
+            };
+            let kind = py_kind(&sig);
+            let kind_index = {
+                let entry = kind_seen
+                    .entry((key.0.clone(), key.1.clone(), kind))
+                    .or_insert(0);
+                *entry += 1;
+                *entry - 1
+            };
+            // A method that the language itself has put out of reach is not
+            // exposed at all.
+            let mut skipped = sig.not_exposed.clone();
+            // A definition that a later definition of the same name has
+            // thrown away cannot be reached either: the class keeps the
+            // last one only. The module keeps the definitions of a static
+            // method and of a class method, so those are reached through
+            // them; an instance method is not kept.
+            if skipped.is_none() && lang == "py" && kind == "instance" && index + 1 < count {
+                skipped = Some(format!(
+                    "the method \"{}\" of the class \"{}\" is shadowed by a later definition of the same name, so it cannot be called from C",
+                    sig.name,
+                    sig.qualifier.clone().unwrap_or_default()
+                ));
+            }
+            if let Some(reason) = &skipped {
+                eprintln!(
+                    "jglc: warning: the method \"{}\" in {} is not exposed through the FFI bridge: {}",
+                    sig.name, f, reason
+                );
+            }
+            out.push(FfiMethod {
+                lang: lang.to_string(),
+                file: f.clone(),
+                class_name,
+                sym: sig.name.clone(),
+                dispatch_name: sig.name.clone(),
+                definition_index: index,
+                definition_count: count,
+                kind_index,
+                py_kind: kind,
+                skipped,
+                sig,
+            });
+        }
+    }
+    out
+}
+
+/// Give every method a unique C symbol. The method name is used whenever it
+/// is unique in the project, so that `extern double f(double)` keeps working.
+/// When two methods share a name, every one of them gets a symbol that
+/// mentions its language and its file, so that no symbol is ever ambiguous.
+fn assign_c_symbols(methods: &mut [FfiMethod]) {
+    // The count is taken over the C symbol, not over the method name: the
+    // symbol of a method is its name, unless the name is a C keyword or a
+    // name the C library reserves, in which case it carries a prefix. Two
+    // methods whose names lead to the same symbol ("int" and "jgl_int"
+    // both lead to "jgl_int") therefore share one count and are told
+    // apart by the name of their language and file.
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for m in methods.iter() {
+        *counts.entry(c_function_name(&m.sig.name)).or_insert(0) += 1;
+    }
+    let mut claimed: HashSet<String> = HashSet::new();
+    for m in methods.iter_mut() {
+        let name = c_function_name(&m.sig.name);
+        if counts.get(&name).copied().unwrap_or(0) == 1 && claimed.insert(name.clone()) {
+            m.sym = name;
+            continue;
+        }
+        let base = format!("{}_{}_{}", m.lang, file_stem(&m.file), name);
+        let mut candidate = base.clone();
+        let mut n = 2;
+        while claimed.contains(&candidate) {
+            candidate = format!("{}_{}", base, n);
+            n += 1;
+        }
+        claimed.insert(candidate.clone());
+        m.sym = candidate;
+    }
+}
+
+/// The symbols the user's own sources define.
+///
+/// A generated FFI stub is a plain external C function, so it must not
+/// carry a name that one of the user's own functions already defines: the
+/// two would be a duplicate definition and the link would fail, or worse,
+/// the linker would pick one of them. Only definitions count here, never
+/// declarations, so a prototype in the user's C does not count.
+fn user_defined_symbols(
+    files_by_lang: &HashMap<String, Vec<String>>,
+    vfs: &Vfs,
+) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    for lang in ["c", "cpp", "rs", "go", "nim", "f90", "zig"] {
+        let Some(files) = files_by_lang.get(lang) else {
+            continue;
+        };
+        for f in files {
+            let Some(entry) = vfs.get(f) else {
+                continue;
+            };
+            for name in defined_symbols(lang, &entry.content) {
+                out.entry(name).or_insert_with(|| f.clone());
+            }
+        }
+    }
+    out
+}
+
+/// The names a source file defines as exported symbols.
+fn defined_symbols(lang: &str, source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    match lang {
+        "c" | "cpp" => {
+            // A C definition is a function body: a return type, a name and
+            // an opening brace. A prototype ends in a semicolon instead and
+            // is only a declaration.
+            let re = Regex::new(
+                r"(?m)^[ \t]*((?:(?:static|inline|extern|const|unsigned|signed|struct|enum|union|class|virtual|__declspec\([^)]*\))[ \t]+)*)[A-Za-z_][A-Za-z0-9_]*[ \t\*]*[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*\([^;{]*\)[ \t\r\n]*(?:const[ \t]*)?\{",
+            )
+            .unwrap();
+            for caps in re.captures_iter(source) {
+                // A static function has internal linkage: it stays inside
+                // its own file and can never take the name of a stub.
+                let modifiers = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                if modifiers.split_whitespace().any(|w| w == "static") {
+                    continue;
+                }
+                if let Some(m) = caps.get(2) {
+                    out.push(m.as_str().to_string());
+                }
+            }
+        }
+        "rs" => {
+            // A Rust function is exported when it carries #[no_mangle] and
+            // is an extern "C" function.
+            let re = Regex::new(
+                r#"(?s)#\[no_mangle\][^;{]*?extern\s+"C"\s+fn\s+([A-Za-z_][A-Za-z0-9_]*)"#,
+            )
+            .unwrap();
+            for caps in re.captures_iter(source) {
+                if let Some(m) = caps.get(1) {
+                    out.push(m.as_str().to_string());
+                }
+            }
+        }
+        "go" => {
+            // A Go function is exported when the comment above it says so.
+            let re = Regex::new(
+                r"(?m)//export\s+([A-Za-z_][A-Za-z0-9_]*)\s*\n(?://[^\n]*\n)*\s*func\s+([A-Za-z_][A-Za-z0-9_]*)",
+            )
+            .unwrap();
+            for caps in re.captures_iter(source) {
+                // The exported name is the one in the comment, the Go name
+                // may differ from it.
+                if let Some(m) = caps.get(1) {
+                    out.push(m.as_str().to_string());
+                }
+            }
+        }
+        "nim" => {
+            // A Nim proc is exported with the exportc pragma.
+            let re = Regex::new(
+                r"(?s)proc\s+([A-Za-z_][A-Za-z0-9_]*)[^\n]*?\{[^}]*?\}\s*\.?\{?[^}]*?exportc",
+            )
+            .unwrap();
+            for caps in re.captures_iter(source) {
+                if let Some(m) = caps.get(1) {
+                    out.push(m.as_str().to_string());
+                }
+            }
+        }
+        "f90" => {
+            // A Fortran procedure is bound to a C name with bind(C).
+            let re = Regex::new(
+                r"(?is)\b(?:function|subroutine)\s+([A-Za-z_][A-Za-z0-9_]*)[^(\n]*\([^)]*\)[^(\n]*\bbind\s*\(\s*c[^)]*\)",
+            )
+            .unwrap();
+            for caps in re.captures_iter(source) {
+                if let Some(m) = caps.get(1) {
+                    out.push(m.as_str().to_string());
+                }
+            }
+            // The name may also be given explicitly: bind(C, name="foo").
+            let named = Regex::new(r#"(?is)\bbind\s*\(\s*c\s*,\s*name\s*=\s*"([^"]+)""#).unwrap();
+            for caps in named.captures_iter(source) {
+                if let Some(m) = caps.get(1) {
+                    out.push(m.as_str().to_string());
+                }
+            }
+        }
+        "zig" => {
+            // A Zig function is exported when it carries the export keyword.
+            let re = Regex::new(r"(?m)^\s*(?:pub\s+)?export\s+fn\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap();
+            for caps in re.captures_iter(source) {
+                if let Some(m) = caps.get(1) {
+                    out.push(m.as_str().to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Refuse to build when an FFI method would take over a symbol that one of
+/// the user's own functions defines.
+fn check_user_symbol_conflicts(
+    methods: &[FfiMethod],
+    files_by_lang: &HashMap<String, Vec<String>>,
+    vfs: &Vfs,
+) -> Result<(), JglcError> {
+    if methods.is_empty() {
+        return Ok(());
+    }
+    let user_symbols = user_defined_symbols(files_by_lang, vfs);
+    if user_symbols.is_empty() {
+        return Ok(());
+    }
+    for m in methods {
+        if let Some(file) = user_symbols.get(&m.sym) {
+            return Err(JglcError::Conflict(format!(
+                "FFI method \"{}\" in {} collides with the function \"{}\" defined in {}. \
+                 Rename one of them.",
+                m.sig.name, m.file, m.sym, file
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Emit the build steps that refuse an FFI stub taking over the name of a C
+/// library function.
+///
+/// A generated stub is a plain external C function. When it carries the
+/// name of a function the C library provides, the linker resolves the
+/// user's own call of that name to the stub, and the program silently
+/// computes the wrong thing. The library's symbols are a property of the
+/// target, so they are looked up by the build and not baked into the
+/// compiler.
+fn emit_libc_conflict_check(script: &mut String, methods: &[FfiMethod], target_win: bool) {
+    let syms: Vec<(String, String, String)> = methods
+        .iter()
+        .map(|m| (m.sym.clone(), m.sig.name.clone(), m.file.clone()))
+        .collect();
+    script.push_str("# Check that no FFI stub takes over a C library function\n");
+    // The compiler of the target is the one that knows the target's library.
+    // When the build cross-compiles, the host compiler would answer about
+    // the host's library, which says nothing about the target, so the check
+    // only uses a compiler that really builds for the target.
+    if target_win {
+        script.push_str("JGL_TARGET_CC=\"${WIN_CC:-}\"\n");
+    } else {
+        script.push_str("JGL_TARGET_CC=\"${CC:-}\"\n");
+    }
+    script.push_str("if [ -z \"$JGL_TARGET_CC\" ]; then\n");
+    if target_win {
+        script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then JGL_TARGET_CC=x86_64-w64-mingw32-gcc; fi\n");
+    } else {
+        script.push_str("    if command -v cc &> /dev/null; then JGL_TARGET_CC=cc; elif command -v gcc &> /dev/null; then JGL_TARGET_CC=gcc; fi\n");
+    }
+    script.push_str("fi\n");
+    // The exported symbols are written to a file: a shell variable holding
+    // thousands of names is unwieldy, and the file can be searched with
+    // grep, which needs no quoting games.
+    script.push_str("JGL_LIBC_SYMS_FILE=$(mktemp 2>/dev/null || echo /tmp/_jgl_libc_syms.$$)\n");
+    script.push_str(": > \"$JGL_LIBC_SYMS_FILE\"\n");
+    script.push_str("if command -v nm &> /dev/null && [ -n \"$JGL_TARGET_CC\" ]; then\n");
+    // The library is found through the target's own compiler, so the path
+    // is never hard coded.
+    script.push_str("    for jgl_lib in $($JGL_TARGET_CC -print-file-name=libc.so.6 2>/dev/null) $($JGL_TARGET_CC -print-file-name=libm.so.6 2>/dev/null); do\n");
+    script.push_str("        case \"$jgl_lib\" in\n");
+    script.push_str("            *.so|*.so.*)\n");
+    script.push_str("                if [ -f \"$jgl_lib\" ]; then\n");
+    // The type column tells text, weak, data and indirect functions apart
+    // from the rest. An indirect function is a resolver the linker calls
+    // instead of the function itself, but the name is still taken, so it
+    // counts as well.
+    script.push_str("                    nm -D --defined-only \"$jgl_lib\" 2>/dev/null \\\n");
+    script.push_str("                        | awk '$2 ~ /^[TWDBRVi]$/ {print $3}' \\\n");
+    script.push_str("                        | sed 's/@.*//' >> \"$JGL_LIBC_SYMS_FILE\"\n");
+    script.push_str("                fi\n");
+    script.push_str("                ;;\n");
+    script.push_str("        esac\n");
+    script.push_str("    done\n");
+    script.push_str("fi\n");
+    // When the library of the target cannot be read, the check of the
+    // library functions is left to the compiler probe alone. That is worth
+    // saying, so that a build which checks only half of the names is not
+    // mistaken for a build which checks all of them.
+    script.push_str("if [ ! -s \"$JGL_LIBC_SYMS_FILE\" ]; then\n    echo \"warning: the C library of the target could not be read; only the functions the compiler knows are checked\" >&2\nfi\n");
+    for (sym, name, file) in &syms {
+        script.push_str(&format!(
+            "if grep -qxF -- '{}' \"$JGL_LIBC_SYMS_FILE\" 2>/dev/null; then\n    echo \"error: FFI method \\\"{}\\\" in {} would override the C library function \\\"{}\\\"; rename the method\" >&2\n    rm -f \"$JGL_LIBC_SYMS_FILE\"\n    exit 1\nfi\n",
+            sym, name, file, sym
+        ));
+    }
+    script.push_str("rm -f \"$JGL_LIBC_SYMS_FILE\"\n");
+    // A name the C library only declares in a header, such as the legacy
+    // "index" of <strings.h>, is not exported by the shared library, so the
+    // symbol list does not hold it. The compiler knows: it refuses a
+    // definition whose type clashes with the declaration in the header. A
+    // probe file therefore asks the compiler about every candidate name.
+    // When no compiler for the target is available, the probe cannot be
+    // run, and the check is skipped rather than failing the build.
+    script.push_str("JGL_CC=\"$JGL_TARGET_CC\"\n");
+    // The probe file has to be read as C source: mktemp names it without an
+    // extension, and the compiler would take it for a linker input and skip
+    // the check.
+    script.push_str("JGL_HDR_PROBE=$(mktemp --suffix=.c 2>/dev/null || echo /tmp/_jgl_hdr_probe.$$.c)\n");
+    script.push_str("cat > \"$JGL_HDR_PROBE\" << 'JGL_HDR_EOF'\n");
+    script.push_str("#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <strings.h>\n#include <math.h>\n#include <time.h>\n#include <ctype.h>\n#include <errno.h>\n#include <signal.h>\n#include <setjmp.h>\n#include <locale.h>\n#include <wchar.h>\n#include <unistd.h>\n");
+    script.push_str("JGL_HDR_EOF\n");
+    // Every candidate is asked about at once. The common case is that none
+    // of them clashes, and then the compiler is run once. Only when the
+    // probe fails are the names asked about one by one, to find the one
+    // that clashes.
+    for (sym, _, _) in &syms {
+        script.push_str(&format!(
+            "printf 'double {0}(double jgl_a);\\n' >> \"$JGL_HDR_PROBE\" 2>/dev/null\n",
+            sym
+        ));
+    }
+    script.push_str("JGL_HDR_ONE=$(mktemp --suffix=.c 2>/dev/null || echo /tmp/_jgl_hdr_one.$$.c)\n");
+    script.push_str("if [ -n \"$JGL_CC\" ] && ! $JGL_CC -x c -fsyntax-only \"$JGL_HDR_PROBE\" 2>/dev/null; then\n");
+    for (sym, name, file) in &syms {
+        script.push_str(&format!(
+            "    printf '#include <stdio.h>\\n#include <stdlib.h>\\n#include <string.h>\\n#include <strings.h>\\n#include <math.h>\\n#include <time.h>\\n#include <ctype.h>\\n#include <errno.h>\\n#include <signal.h>\\n#include <setjmp.h>\\n#include <locale.h>\\n#include <wchar.h>\\n#include <unistd.h>\\ndouble {0}(double jgl_a);\\n' > \"$JGL_HDR_ONE\" 2>/dev/null\n    if ! $JGL_CC -x c -fsyntax-only \"$JGL_HDR_ONE\" 2>/dev/null; then\n        echo \"error: FFI method \\\"{1}\\\" in {2} would override the C library function \\\"{0}\\\"; rename the method\" >&2\n        rm -f \"$JGL_HDR_PROBE\" \"$JGL_HDR_ONE\"\n        exit 1\n    fi\n",
+            sym, name, file
+        ));
+    }
+    script.push_str("fi\n");
+    script.push_str("rm -f \"$JGL_HDR_PROBE\" \"$JGL_HDR_ONE\"\n");
+    script.push_str("\n");
+}
+
+/// Render the header that declares the FFI methods to the user's own C code.
+///
+/// The header names the real symbols of the generated stubs, so that the
+/// user does not have to write the declarations by hand, and so that a
+/// method whose name had to be changed still has a declaration the user
+/// can find. A method that returns a string hands its result to the
+/// caller, who has to release it.
+fn ffi_header_source(methods: &[FfiMethod]) -> String {
+    let mut out = String::new();
+    out.push_str("/* Generated by jglc - the declarations of the FFI bridge.\n");
+    out.push_str("   Include this file to call the methods of the project's other\n");
+    out.push_str("   languages from C:  #include \"jgl_ffi.h\"\n");
+    out.push_str("   A method that returns a string hands its result to the caller,\n");
+    out.push_str("   who has to release it with free(). */\n");
+    out.push_str("#ifndef JGL_FFI_H\n");
+    out.push_str("#define JGL_FFI_H\n\n");
+    out.push_str("#ifdef __cplusplus\n");
+    out.push_str("extern \"C\" {\n");
+    out.push_str("#endif\n\n");
+    for m in methods {
+        let ret_c = c_return_type_kind(ffi_ret_kind(m));
+        let params = build_c_params(&m.sig);
+        let param_decl = if params.trim().is_empty() {
+            "void".to_string()
+        } else {
+            params
+        };
+        // The return type of a string is a pointer, so it is declared as
+        // "char *" and not as "char*".
+        let ret_decl = match ret_c.as_str() {
+            "char*" => "char *".to_string(),
+            other => format!("{} ", other),
+        };
+        // A value that has no C representation is told so in the header, so
+        // that the user knows before the call that the value is not a
+        // number.
+        let note = if let Some(reason) = &m.sig.not_callable {
+            format!(" - the method cannot be called from C: {}", reason)
+        } else if return_is_not_representable(&m.sig.return_type) {
+            format!(
+                " - the return value is a {}, which cannot be handed to C",
+                m.sig.return_type
+            )
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "/* {} ({}){} */\n{}{}({});\n",
+            m.sig.name, m.file, note, ret_decl, m.sym, param_decl
+        ));
+    }
+    out.push_str("\n#ifdef __cplusplus\n");
+    out.push_str("}\n");
+    out.push_str("#endif\n\n");
+    out.push_str("#endif /* JGL_FFI_H */\n");
+    out
+}
+
+/// Whether the value a method returns can be handed to C.
+///
+/// A table, a userdata, a thread and a function have no C representation.
+/// The bridge says so when the call is made, and the header says it too.
+fn return_is_not_representable(ret_type: &str) -> bool {
+    matches!(
+        normalize_type_name(ret_type).as_str(),
+        "table" | "userdata" | "thread" | "function"
+    )
+}
+
+/// Give every overload of a method a name of its own.
+///
+/// A class may declare the same method name more than once, with different
+/// parameter types. The bridge dispatches on the name alone, so the first
+/// overload would swallow every call. Each overload therefore gets a
+/// distinct dispatch name, and the stub passes that name to the bridge.
+fn disambiguate_overloads(methods: &mut [FfiMethod]) {
+    // The overloads are counted per class: two classes may each declare
+    // "area" without shadowing one another.
+    let mut counts: HashMap<(String, String), usize> = HashMap::new();
+    for m in methods.iter() {
+        let class = m.class_name.clone().unwrap_or_default();
+        *counts.entry((class, m.sig.name.clone())).or_insert(0) += 1;
+    }
+    let mut next: HashMap<(String, String), usize> = HashMap::new();
+    for m in methods.iter_mut() {
+        let class = m.class_name.clone().unwrap_or_default();
+        let key = (class, m.sig.name.clone());
+        if counts.get(&key).copied().unwrap_or(0) < 2 {
+            continue;
+        }
+        // The first overload keeps the plain name, so that a class with
+        // overloads still answers to the name the sources use.
+        let n = next.entry(key).or_insert(1);
+        if *n == 1 {
+            *n += 1;
+            continue;
+        }
+        *n += 1;
+        m.dispatch_name = format!("{}#{}", m.sig.name, *n - 1);
+    }
+}
+
+/// Group the methods of a language by the class they belong to.
+fn group_by_class<'a>(methods: &[&'a FfiMethod]) -> Vec<(String, Vec<&'a FfiMethod>)> {
+    let mut groups: Vec<(String, Vec<&'a FfiMethod>)> = Vec::new();
+    for m in methods {
+        let key = m.class_name.clone().unwrap_or_default();
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, list)) => list.push(m),
+            None => groups.push((key, vec![m])),
+        }
+    }
+    groups
+}
+
+/// C symbol name of an embedded payload: "ops.py" -> "ops_py".
+fn c_symbol_name(path: &str) -> String {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    file.chars()
+        .map(|c| if c == '.' || c == '-' { '_' } else { c })
+        .collect()
+}
+
+/// Precompiled JavaScript counterpart of a TypeScript source file. The name
+/// is distinct from any hand written JavaScript file of the project.
+fn ts_js_name(path: &str) -> String {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    match file.strip_suffix(".ts") {
+        Some(stem) => format!("{}.jgl.js", stem),
+        None => file.to_string(),
+    }
+}
+
+/// The C symbol of the embedded payload of a source file.
+fn payload_symbol(lang: &str, file: &str) -> String {
+    match lang {
+        "ts" => c_symbol_name(&ts_js_name(file)),
+        _ => c_symbol_name(file),
+    }
+}
+
+/// The temporary file the embedded source of a file is written to at runtime.
+/// The C symbol is unique across the project, so two files of the same
+/// language never write over each other.
+fn temp_script_path(lang: &str, method: &str) -> String {
+    let ext = match lang {
+        "py" => "py",
+        "lua" => "lua",
+        _ => "js",
+    };
+    format!("/tmp/_jgl_{}_{}.{}", lang, method, ext)
+}
+
+/// The kind of value a method returns.
+fn ret_kind(ret_type: &str) -> RetKind {
+    match normalize_type_name(ret_type).as_str() {
+        "void" | "none" | "unit" | "null" => RetKind::Void,
+        "bool" | "boolean" => RetKind::Bool,
+        "int" | "integer" | "long" | "short" | "byte" | "i32" | "i64" | "int32" | "int64"
+        | "uint" | "uint32" | "uint64" | "bigint" | "size_t" => RetKind::Int,
+        "string" | "str" | "text" | "char" | "charsequence" => RetKind::Text,
+        _ => RetKind::Float,
+    }
+}
+
+/// Map a source-language return type onto the C type used by the FFI stub.
+fn c_return_type(ret_type: &str) -> String {
+    c_return_type_kind(ret_kind(ret_type))
+}
+
+/// The C type a value of the given kind is returned as.
+fn c_return_type_kind(kind: RetKind) -> String {
+    match kind {
+        RetKind::Void => "void".to_string(),
+        RetKind::Float => "double".to_string(),
+        RetKind::Int => "long".to_string(),
+        RetKind::Bool => "int".to_string(),
+        RetKind::Text => "char*".to_string(),
+    }
+}
+
+/// The type a C# task carries, when a method returns one.
+///
+/// "Task<double>" carries a double, "Task<int>" an int. The generic argument
+/// is part of the return type, so it is still there to be read.
+fn cs_task_inner(ret_type: &str) -> Option<String> {
+    let t = ret_type.trim();
+    let lower = t.to_lowercase();
+    let start = if lower.starts_with("system.threading.tasks.task<") {
+        "system.threading.tasks.task<".len()
+    } else if lower.starts_with("system.threading.tasks.valuetask<") {
+        "system.threading.tasks.valuetask<".len()
+    } else if lower.starts_with("valuetask<") {
+        "valuetask<".len()
+    } else if lower.starts_with("task<") {
+        "task<".len()
+    } else {
+        return None;
+    };
+    let inner = t.get(start..)?.trim();
+    let inner = inner.strip_suffix('>')?.trim();
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner.to_string())
+    }
+}
+
+/// How a C# method hands its value back.
+///
+/// A method may return a task. The bridge awaits the task, so the value the C
+/// caller sees is the one the task carries.
+#[derive(Debug, Clone)]
+enum CsRet {
+    /// A plain value of the given kind.
+    Value(RetKind),
+    /// A task that carries a value of the given kind.
+    Task(RetKind, String),
+    /// A task that carries nothing.
+    TaskVoid,
+}
+
+/// How a C# method returns its value.
+fn cs_return(ret_type: &str) -> CsRet {
+    let t = ret_type.trim();
+    let lower = t.to_lowercase();
+    if lower == "task"
+        || lower == "valuetask"
+        || lower == "system.threading.tasks.task"
+        || lower == "system.threading.tasks.valuetask"
+    {
+        return CsRet::TaskVoid;
+    }
+    match cs_task_inner(t) {
+        Some(inner) => CsRet::Task(ret_kind(&inner), inner),
+        None => CsRet::Value(ret_kind(t)),
+    }
+}
+
+/// The kind of value a method returns.
+///
+/// A C# method may return a task, and then the value the C caller sees is
+/// the one the task carries.
+fn ffi_ret_kind(m: &FfiMethod) -> RetKind {
+    if m.lang == "cs" {
+        return match cs_return(&m.sig.return_type) {
+            CsRet::Value(k) | CsRet::Task(k, _) => k,
+            CsRet::TaskVoid => RetKind::Void,
+        };
+    }
+    ret_kind(&m.sig.return_type)
+}
+
+/// fscanf conversion specifier matching a C return type.
+fn c_return_scanfmt(c_ret_type: &str) -> &'static str {
+    match c_ret_type {
+        "double" => "lf",
+        "long" => "ld",
+        "int" => "d",
+        _ => "lf",
+    }
+}
+
+/// Name of the Nth positional argument in a generated C stub.
+fn c_param_name(idx: usize) -> String {
+    format!("arg{}", idx)
+}
+
+/// Render the C parameter list of a stub: "double arg0, const char *arg1".
+fn build_c_params(method: &MethodSig) -> String {
+    method
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            // `to_c_type` yields a pointer type for strings and collections;
+            // in a parameter list the star belongs to the declarator.
+            let c_type = p.jgl_type.to_c_type();
+            match c_type.strip_prefix("*const ") {
+                Some(base) => format!("const {} *{}", base, c_param_name(i)),
+                None => format!("{} {}", c_type, c_param_name(i)),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// How one argument of a subprocess call is rendered.
+#[derive(Debug, Clone)]
+struct CmdArg {
+    /// The C expression that yields the value.
+    expr: String,
+    /// The format that renders the value as text, if it needs one.
+    fmt: Option<&'static str>,
+    /// The value has to be quoted for the shell.
+    shell_quote: bool,
+    /// The value is a flag that becomes a Lua boolean literal.
+    lua_bool: bool,
+}
+
+/// The arguments of a call, as they are rendered for a shell command line.
+fn shell_cmd_args(method: &MethodSig) -> Vec<CmdArg> {
+    method
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let expr = c_param_name(i);
+            match p.jgl_type {
+                JglType::Double => CmdArg {
+                    // A double travels as the hexadecimal digits of its bit
+                    // pattern, so that every value survives, including the
+                    // infinite ones and the not-a-numbers.
+                    expr: format!("jgl_double_bits({})", c_param_name(i)),
+                    fmt: Some("%016llx"),
+                    shell_quote: false,
+                    lua_bool: false,
+                },
+                JglType::Int => CmdArg {
+                    expr,
+                    fmt: Some("%ld"),
+                    shell_quote: false,
+                    lua_bool: false,
+                },
+                JglType::Bool => CmdArg {
+                    expr,
+                    fmt: Some("%d"),
+                    shell_quote: false,
+                    lua_bool: false,
+                },
+                JglType::String | JglType::Array | JglType::Object => CmdArg {
+                    expr,
+                    fmt: None,
+                    shell_quote: true,
+                    lua_bool: false,
+                },
+            }
+        })
+        .collect()
+}
+
+/// The arguments of a call, as they are embedded in a Lua source literal.
+fn lua_cmd_args(method: &MethodSig) -> Vec<CmdArg> {
+    method
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let expr = c_param_name(i);
+            match p.jgl_type {
+                JglType::Double => CmdArg {
+                    // The value is embedded in the Lua source, so the Lua
+                    // helper rebuilds it from the hexadecimal digits of its
+                    // bit pattern.
+                    expr: format!("jgl_double_bits({})", c_param_name(i)),
+                    fmt: Some("jgl_hexdouble(\"%016llx\")"),
+                    shell_quote: false,
+                    lua_bool: false,
+                },
+                JglType::Int => CmdArg {
+                    expr,
+                    fmt: Some("%ld"),
+                    shell_quote: false,
+                    lua_bool: false,
+                },
+                JglType::Bool => CmdArg {
+                    expr,
+                    fmt: None,
+                    shell_quote: false,
+                    lua_bool: true,
+                },
+                JglType::String | JglType::Array | JglType::Object => CmdArg {
+                    expr,
+                    fmt: None,
+                    shell_quote: true,
+                    lua_bool: false,
+                },
+            }
+        })
+        .collect()
+}
+
+/// The buffer declarations the arguments of a call need.
+fn cmd_arg_bufs(args: &[CmdArg]) -> String {
+    let mut out = String::new();
+    for (i, a) in args.iter().enumerate() {
+        if a.fmt.is_some() {
+            // A number never needs more than a few dozen characters.
+            out.push_str(&format!("    char val{}[64];\n", i));
+        }
+        if a.shell_quote {
+            // The quoted value is allocated, so that a value of any length
+            // survives.
+            out.push_str(&format!("    char *buf{} = NULL;\n", i));
+        }
+    }
+    out
+}
+
+/// The code that renders the arguments into the `arglist` buffer as the
+/// words of a shell command line. Every word is quoted, so a value can never
+/// be read as more than one word. The buffer grows, so that a value of any
+/// length survives.
+fn build_shell_arg_list(args: &[CmdArg], ret_c: &str) -> String {
+    let mut out = String::new();
+    // A call without arguments needs no argument list at all. The buffer
+    // would be 64 KiB that is never used and never released.
+    if args.is_empty() {
+        return out;
+    }
+    out.push_str(&format!(
+        "    char *arglist = (char *)malloc({});\n",
+        ARGLIST_CAP
+    ));
+    out.push_str(&format!("    size_t arglistcap = {};\n", ARGLIST_CAP));
+    out.push_str(&format!("    if (!arglist) {{\n{}    }}\n", c_bail(ret_c, "")));
+    out.push_str("    arglist[0] = '\\0';\n");
+    for (i, a) in args.iter().enumerate() {
+        if a.fmt.is_some() {
+            out.push_str(&format!(
+                "    snprintf(val{}, sizeof(val{}), \"{}\", {});\n",
+                i,
+                i,
+                a.fmt.unwrap(),
+                a.expr
+            ));
+        }
+        let value = match a.fmt {
+            Some(_) => format!("val{}", i),
+            None => a.expr.clone(),
+        };
+        if a.shell_quote {
+            out.push_str(&format!("    buf{} = jgl_shquote({});\n", i, value));
+            out.push_str(&format!(
+                "    if (buf{}) {{ jgl_add_word(&arglist, &arglistcap, buf{}); free(buf{}); }}\n",
+                i, i, i
+            ));
+        } else {
+            out.push_str(&format!(
+                "    jgl_add_word(&arglist, &arglistcap, {});\n",
+                value
+            ));
+        }
+    }
+    out
+}
+
+/// The argument list of a Lua call: the format of the list, the C
+/// expressions that fill it, the statements that allocate the buffers those
+/// expressions write into and the statements that release them.
+///
+/// The values are embedded in the Lua source, so the interpreter never has
+/// to parse a command line.
+struct LuaCall {
+    /// The format of the argument list.
+    format: String,
+    /// The C expressions that fill the format.
+    args: String,
+    /// The statements that allocate the buffers.
+    prelude: String,
+    /// The statements that release the buffers.
+    cleanup: String,
+}
+
+fn build_lua_call_args(m: &MethodSig) -> LuaCall {
+    let args = lua_cmd_args(m);
+    let mut fmt = String::new();
+    let mut exprs: Vec<String> = Vec::new();
+    let mut prelude = String::new();
+    let mut cleanup = String::new();
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 {
+            fmt.push_str(", ");
+        }
+        if a.lua_bool {
+            fmt.push_str("%s");
+            exprs.push(format!("jgl_luabool({})", a.expr));
+        } else {
+            match a.fmt {
+                Some(f) => {
+                    fmt.push_str(f);
+                    exprs.push(a.expr.clone());
+                }
+                None => {
+                    // The quotes belong to the Lua source, so they are part of
+                    // the literal text around the value, not of its format.
+                    fmt.push_str("%s");
+                    prelude.push_str(&format!(
+                        "    char *lua_buf{} = jgl_luaquote({});\n",
+                        i, a.expr
+                    ));
+                    cleanup.push_str(&format!("    free(lua_buf{});\n", i));
+                    exprs.push(format!("lua_buf{}", i));
+                }
+            }
+        }
+    }
+    LuaCall {
+        format: fmt,
+        args: exprs.join(", "),
+        prelude,
+        cleanup,
+    }
+}
+
+/// The Lua expression that resolves the function of a method.
+///
+/// A Lua function may be a global, a member of a table or published by a
+/// module the file returns. Every form is tried, and the "or" short circuits
+/// so that a missing entry never raises an error.
+fn lua_lookup_expr(m: &MethodSig) -> String {
+    let mut candidates = vec![
+        format!("mod.{}", m.call_expr),
+        format!("_G.{}", m.call_expr),
+    ];
+    if let Some(alt) = &m.alt_call_expr {
+        // A function declared as "M.f" is published as "f", but it is also
+        // reachable through the table it was declared in.
+        candidates.push(format!("_G.{}", alt));
+        candidates.push(format!("mod.{}", alt));
+    }
+    candidates.join(" or ")
+}
+
+/// The arguments of a Python call: the ones that are passed by position and
+/// the ones that are passed by name.
+fn py_call_args(m: &MethodSig) -> (Vec<String>, Vec<(String, String)>) {
+    let mut positional: Vec<String> = Vec::new();
+    let mut keyword: Vec<(String, String)> = Vec::new();
+    for (i, p) in m.params.iter().enumerate() {
+        let idx = i + 1;
+        let value = match p.jgl_type {
+            JglType::Double => format!(
+                "struct.unpack('>d', struct.pack('>Q', int(sys.argv[{}], 16)))[0]",
+                idx
+            ),
+            JglType::Int => format!("int(sys.argv[{}])", idx),
+            JglType::String => format!("sys.argv[{}]", idx),
+            JglType::Bool => {
+                format!("sys.argv[{}] in (\"1\", \"true\", \"True\")", idx)
+            }
+            JglType::Array | JglType::Object => format!("json.loads(sys.argv[{}])", idx),
+        };
+        // A parameter that can only be passed by keyword is handed its
+        // value by name.
+        if p.keyword_only {
+            keyword.push((p.name.clone(), value));
+        } else {
+            positional.push(value);
+        }
+    }
+    (positional, keyword)
+}
+
+
+/// The expression that calls a Python method.
+fn py_call_expr(m: &FfiMethod, positional_count: usize, has_keyword: bool) -> String {
+    // The arguments are read before the module runs, so the call refers to
+    // the values that were read then.
+    let mut parts: Vec<String> = (0..positional_count)
+        .map(|i| format!("_jgl_args[{}]", i))
+        .collect();
+    if has_keyword {
+        parts.push("**_jgl_kwargs".to_string());
+    }
+    let args = parts.join(", ");
+    // A property is read, not called: the value of the attribute is the
+    // value of the method.
+    let call = if m.sig.property {
+        match &m.sig.qualifier {
+            Some(class) => format!("{}().{}", class, m.sig.name),
+            None => m.sig.name.clone(),
+        }
+    } else {
+        // An instance method cannot be called through the class: it needs
+        // an instance to bind "self" to. The class is instantiated and the
+        // method is called on that instance.
+        match (m.sig.needs_receiver, &m.sig.qualifier) {
+            (true, Some(class)) => format!("{}().{}({})", class, m.sig.name, args),
+            _ => format!("{}({})", m.sig.call_expr, args),
+        }
+    };
+    // A coroutine has to be run on an event loop, and a generator hands its
+    // value out one by one instead of returning it.
+    if m.sig.py.coroutine {
+        format!("asyncio.run({})", call)
+    } else if m.sig.py.generator {
+        format!("next({})", call)
+    } else {
+        call
+    }
+}
+
+/// The Python code that collects the definitions a module makes.
+///
+/// The class holds the last declaration of a name only, so an earlier one
+/// is reached through the definition the module made of it. The
+/// definitions are collected while the module runs, so that the one the
+/// call means can be picked out of them.
+const PY_REGISTRY: &str = r#"_jgl_defs = []
+class _JglStatic(__import__("builtins").staticmethod):
+    def __init__(self, f):
+        __import__("builtins").staticmethod.__init__(self, f)
+        _jgl_defs.append(("static", f))
+class _JglClass(__import__("builtins").classmethod):
+    def __init__(self, f):
+        __import__("builtins").classmethod.__init__(self, f)
+        _jgl_defs.append(("class", f))
+staticmethod = _JglStatic
+classmethod = _JglClass
+def _jgl_call(qualname, kind, index, args, kwargs):
+    picked = None
+    seen = 0
+    for d in _jgl_defs:
+        if d[0] == kind and _jgl_getattr(d[1], "__qualname__", "") == qualname:
+            if seen == index:
+                picked = d[1]
+                break
+            seen += 1
+    if picked is None:
+        raise _jgl_RuntimeError("JglBridge: the definition of " + qualname + " was not found")
+    return picked(*args, **kwargs)
+"#;
+
+/// The Python program that calls a method.
+///
+/// The builtins the bridge uses and the arguments of the call are taken
+/// before the module runs, so that a module with a name of its own cannot
+/// take them away.
+fn py_program(
+    prelude: &str,
+    temp: &str,
+    stmt: &str,
+    positional: &[String],
+    keyword: &[(String, String)],
+    registry: bool,
+) -> String {
+    let mut program = String::new();
+    program.push_str(prelude);
+    program.push('\n');
+    program.push_str("_jgl_print = __import__(\"builtins\").print\n");
+    program.push_str("_jgl_str = __import__(\"builtins\").str\n");
+    program.push_str("_jgl_int = __import__(\"builtins\").int\n");
+    program.push_str("_jgl_getattr = __import__(\"builtins\").getattr\n");
+    program.push_str("_jgl_RuntimeError = __import__(\"builtins\").RuntimeError\n");
+    // A single argument needs a comma of its own, so that the list is a
+    // tuple and not the value itself.
+    let args = if positional.len() == 1 {
+        format!("({},)", positional[0])
+    } else {
+        format!("({})", positional.join(", "))
+    };
+    program.push_str(&format!("_jgl_args = {}\n", args));
+    if keyword.is_empty() {
+        program.push_str("_jgl_kwargs = {}\n");
+    } else {
+        let parts: Vec<String> = keyword
+            .iter()
+            .map(|(name, value)| format!("\"{}\": {}", name, value))
+            .collect();
+        program.push_str(&format!("_jgl_kwargs = {{{}}}\n", parts.join(", ")));
+    }
+    if registry {
+        program.push_str(PY_REGISTRY);
+    }
+    program.push_str(&format!("exec(open(\"{}\").read())\n", temp));
+    program.push_str(stmt);
+    program.push('\n');
+    program
+}
+
+/// Escape a string so it can be embedded in a Python string literal.
+fn py_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// TypeScript/Node call-argument expression list.
+fn build_ts_args(m: &MethodSig) -> String {
+    m.params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let idx = i + 1;
+            match p.jgl_type {
+                JglType::Double => format!("jglHexDouble(process.argv[{}])", idx),
+                JglType::Int => format!("Number(process.argv[{}])", idx),
+                JglType::Bool => format!(
+                    "process.argv[{}] === \"1\" || process.argv[{}] === \"true\"",
+                    idx, idx
+                ),
+                JglType::String => format!("process.argv[{}]", idx),
+                JglType::Array | JglType::Object => {
+                    if p.rest && p.jgl_type == JglType::Array {
+                        // A rest parameter collects the values of the
+                        // array, so they are spread into the call.
+                        format!("...JSON.parse(process.argv[{}])", idx)
+                    } else {
+                        format!("JSON.parse(process.argv[{}])", idx)
+                    }
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Escape a string so it can be embedded verbatim in a C string literal.
+fn c_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Emit a bash heredoc writing `content` verbatim to `path`.
+fn push_heredoc(script: &mut String, path: &str, delimiter: &str, content: &str, indent: &str) {
+    script.push_str(&format!("{}cat > {} << '{}'\n", indent, path, delimiter));
+    for line in content.lines() {
+        if line.is_empty() {
+            script.push('\n');
+        } else {
+            script.push_str(indent);
+            script.push_str(line);
+            script.push('\n');
+        }
+    }
+    // The heredoc terminator has to start at column 0.
+    script.push_str(delimiter);
+    script.push('\n');
+}
+
+/// Preamble of the generated FFI C bridge files.
+fn c_bridge_preamble(comment: &str) -> String {
+    format!(
+        "/* {} */\n#define _GNU_SOURCE\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <stdint.h>\n#include <sys/wait.h>\n\n",
+        comment
+    )
+}
+
+/// One word of a generated command line.
+struct CmdWord {
+    /// The C expression that yields the word.
+    expr: String,
+    /// The word has to be quoted for the shell.
+    quote: bool,
+}
+
+/// The command line of a subprocess call.
+struct CmdLine {
+    /// The words that are known at generation time.
+    literals: Vec<(String, bool)>,
+    /// The words that are only known at run time.
+    runtime: Vec<CmdWord>,
+    /// The argument list, when the call has arguments.
+    arglist: bool,
+}
+
+/// The interpreted program a stub runs.
+struct Program<'a> {
+    /// The C statements that run before the program is built. They may
+    /// allocate the buffers the argument expressions write into.
+    prelude: &'a str,
+    /// The literal part of the program, before the argument list. It may
+    /// contain any character.
+    literal: &'a str,
+    /// The format of the argument list that is embedded in the program, when
+    /// it has one.
+    format: Option<&'a str>,
+    /// The C expressions that fill the format.
+    args: &'a str,
+    /// The literal part of the program, after the argument list.
+    suffix: &'a str,
+    /// The C statements that release the buffers the prelude allocated.
+    cleanup: &'a str,
+}
+
+/// The capacity of the command line buffer of a stub. The command holds the
+/// program and the argument list, so it has to be larger than both.
+const CMD_CAP: usize = 262144;
+
+/// The capacity of the program buffer of a stub.
+const PROG_CAP: usize = 65536;
+
+/// The capacity of the argument list buffer of a stub.
+const ARGLIST_CAP: usize = 65536;
+
+/// The prefix of the marker the bridge writes in front of the value it
+/// returns.
+///
+/// The result is read from the output that follows the marker, so that
+/// whatever the target printed besides cannot be mistaken for the result.
+/// The marker carries a nonce that is different in every build, so that a
+/// target cannot put the marker into its own output and have its text
+/// taken for the result.
+const RESULT_MARKER_PREFIX: &str = "__JGL_R__";
+
+/// The marker of this build: the prefix and a nonce that is different in
+/// every build.
+fn result_marker() -> String {
+    format!("{}{}", RESULT_MARKER_PREFIX, result_nonce())
+}
+
+/// The nonce of the marker: sixteen hexadecimal digits that are different
+/// in every build.
+///
+/// The nonce keeps a target from putting the marker into its own output.
+/// It is made of characters that need no quoting, so that it survives the
+/// shell and the languages the bridge runs in unchanged.
+fn result_nonce() -> String {
+    let mut bytes = [0u8; 8];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        if f.read_exact(&mut bytes).is_ok() {
+            return bytes.iter().map(|b| format!("{:02x}", b)).collect();
+        }
+    }
+    // Without a source of randomness the clock and the process serve.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mixed = nanos ^ ((std::process::id() as u64) << 32);
+    format!("{:016x}", mixed)
+}
+
+/// The statements that leave a stub early when a buffer cannot be allocated.
+/// The caller wraps them in the opening brace of its own "if".
+///
+/// The buffers that were allocated before the failure are released, so
+/// that a stub that is called many times does not grow without bound.
+fn c_bail(ret_c: &str, frees: &str) -> String {
+    format!(
+        "    if (p) {{ pclose(p); }}\n{}{}\n",
+        frees,
+        bail_return(ret_c)
+    )
+}
+
+/// The statement that leaves a stub with a value of the given C type.
+fn bail_return(ret_c: &str) -> String {
+    match ret_c {
+        "void" => "return;".to_string(),
+        "char*" => "return NULL;".to_string(),
+        _ => "return 0;".to_string(),
+    }
+}
+
+/// The stub of a method that cannot be called from C.
+///
+/// The call is refused with the reason, so that the caller knows why the
+/// method does not answer with a value.
+fn not_callable_stub(ret_c: &str, sym: &str, params: &str, reason: &str) -> String {
+    let param_decl = if params.trim().is_empty() {
+        "void".to_string()
+    } else {
+        params.to_string()
+    };
+    format!(
+        "{ret} {sym}({params}) {{\n    fprintf(stderr, \"JglBridge: {reason}\\n\");\n    {value}\n}}\n",
+        ret = ret_c,
+        sym = sym,
+        params = param_decl,
+        reason = c_escape(reason),
+        value = bail_return(ret_c)
+    )
+}
+
+/// Body of a subprocess-backed C stub: write the payload, run the runtime
+/// and read the result back from stdout.
+///
+/// `cmd` holds the words of the command line: the literal ones, the ones
+/// that are only known at run time and the argument list.
+fn c_stub_body(
+    ret_c: &str,
+    name: &str,
+    params: &str,
+    preamble: &str,
+    program: Option<Program<'_>>,
+    cmd: &CmdLine,
+    marker: &str,
+) -> String {
+    let param_decl = if params.trim().is_empty() {
+        "void".to_string()
+    } else {
+        params.to_string()
+    };
+    let has_program = program.is_some();
+    // The statements that release the buffers the program allocated. They
+    // run on every path that leaves the stub.
+    let program_cleanup = program
+        .as_ref()
+        .map(|p| p.cleanup.to_string())
+        .unwrap_or_default();
+    // The buffers that are already there when a buffer cannot be
+    // allocated: the argument list and the buffers of the program.
+    let mut early_frees = String::new();
+    if cmd.arglist {
+        early_frees.push_str("    free(arglist);\n");
+    }
+    early_frees.push_str(&program_cleanup);
+    // The same, with the program itself, which is allocated by then.
+    let mut cmd_frees = String::new();
+    if has_program {
+        cmd_frees.push_str("    free(prog);\n");
+    }
+    cmd_frees.push_str(&early_frees);
+    let mut out = String::new();
+    out.push_str(&format!("{} {}({}) {{\n", ret_c, name, param_decl));
+    // The pipe is declared up front, so that the early exits below can
+    // close it.
+    out.push_str("    FILE *p = NULL;\n");
+    out.push_str(preamble);
+    if let Some(p) = &program {
+        // The buffers the argument expressions write into are allocated
+        // first, so that the expressions can fill them.
+        out.push_str(p.prelude);
+        // The program is built in an allocated buffer, so that a value of any
+        // length fits into it.
+        out.push_str(&format!("    char *prog = (char *)malloc({});\n", PROG_CAP));
+        out.push_str(&format!("    size_t progcap = {};\n", PROG_CAP));
+        out.push_str(&format!(
+            "    if (!prog) {{\n{}    }}\n",
+            c_bail(ret_c, &early_frees)
+        ));
+        out.push_str("    prog[0] = '\\0';\n");
+        // The literal parts are written first, so that a percent sign in them
+        // can never be read as a conversion.
+        out.push_str(&format!(
+            "    jgl_add(&prog, &progcap, \"{}\");\n",
+            c_escape(p.literal)
+        ));
+        if let (Some(fmt), true) = (p.format, !p.args.trim().is_empty()) {
+            // The formatted part is measured first, so that the buffer can
+            // grow to hold it.
+            out.push_str(&format!(
+                "    int jgl_n = snprintf(NULL, 0, \"{}\", {});\n",
+                c_escape(fmt),
+                p.args
+            ));
+            out.push_str("    if (jgl_n > 0) {\n");
+            out.push_str("        char *jgl_part = (char *)malloc((size_t)jgl_n + 1);\n");
+            out.push_str("        if (jgl_part) {\n");
+            out.push_str(&format!(
+                "            snprintf(jgl_part, (size_t)jgl_n + 1, \"{}\", {});\n",
+                c_escape(fmt),
+                p.args
+            ));
+            out.push_str("            jgl_add(&prog, &progcap, jgl_part);\n");
+            out.push_str("            free(jgl_part);\n");
+            out.push_str("        }\n");
+            out.push_str("    }\n");
+        }
+        if !p.suffix.is_empty() {
+            out.push_str(&format!(
+                "    jgl_add(&prog, &progcap, \"{}\");\n",
+                c_escape(p.suffix)
+            ));
+        }
+    }
+    out.push_str(&format!("    char *cmd = (char *)malloc({});\n", CMD_CAP));
+    out.push_str(&format!("    size_t cmdcap = {};\n", CMD_CAP));
+    out.push_str(&format!(
+        "    if (!cmd) {{\n{}    }}\n",
+        c_bail(ret_c, &cmd_frees)
+    ));
+    out.push_str("    cmd[0] = '\\0';\n");
+    for (w, q) in &cmd.literals {
+        out.push_str(&format!(
+            "    jgl_app(&cmd, &cmdcap, \"{}\", {});\n",
+            c_escape(w),
+            if *q { 1 } else { 0 }
+        ));
+    }
+    for w in &cmd.runtime {
+        out.push_str(&format!(
+            "    jgl_app(&cmd, &cmdcap, {}, {});\n",
+            w.expr,
+            if w.quote { 1 } else { 0 }
+        ));
+    }
+    if cmd.arglist {
+        out.push_str("    jgl_app(&cmd, &cmdcap, arglist, 0);\n");
+    }
+    out.push_str("    p = popen(cmd, \"r\");\n");
+    // A runtime that is not installed at all is reported: the call cannot
+    // go through, and the caller has to know why.
+    let runtime = cmd
+        .literals
+        .first()
+        .map(|(w, _)| w.clone())
+        .unwrap_or_else(|| "the runtime".to_string());
+    out.push_str("    if (!p) {\n");
+    out.push_str(&format!(
+        "        fprintf(stderr, \"JglBridge: the runtime {} could not be started\\n\");\n",
+        runtime
+    ));
+    out.push_str("        free(cmd);\n");
+    if has_program {
+        out.push_str("        free(prog);\n");
+    }
+    if cmd.arglist {
+        out.push_str("        free(arglist);\n");
+    }
+    if let Some(p) = &program {
+        if !p.cleanup.trim().is_empty() {
+            out.push_str(p.cleanup);
+        }
+    }
+    out.push_str(&format!("        {}\n", bail_return(ret_c)));
+    out.push_str("    }\n");
+    out.push_str(&c_result_reader(ret_c, &runtime, marker));
+    // The buffers are released before the result is handed back, so that a
+    // stub that is called many times does not grow without bound.
+    out.push_str("    free(cmd);\n");
+    if has_program {
+        out.push_str("    free(prog);\n");
+    }
+    if cmd.arglist {
+        out.push_str("    free(arglist);\n");
+    }
+    if let Some(p) = &program {
+        if !p.cleanup.trim().is_empty() {
+            out.push_str(p.cleanup);
+        }
+    }
+    if ret_c != "void" {
+        out.push_str("    return result;\n");
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// The code that reads the result of a subprocess back out of its stdout.
+/// The result is left in a variable named "result".
+fn c_result_reader(ret_c: &str, runtime: &str, marker: &str) -> String {
+    let mut out = String::new();
+    // The output of the subprocess is read whole, so that the result can be
+    // found in it wherever the subprocess put it. The buffer grows, so that
+    // a value of any length survives.
+    out.push_str("    char *jgl_out = NULL;\n");
+    out.push_str("    size_t jgl_outlen = 0;\n");
+    out.push_str("    size_t jgl_outcap = 4096;\n");
+    out.push_str("    int jgl_status = 0;\n");
+    out.push_str("    jgl_out = (char *)malloc(jgl_outcap);\n");
+    out.push_str("    if (jgl_out) {\n");
+    out.push_str("        for (;;) {\n");
+    out.push_str("            if (jgl_outlen + 1 >= jgl_outcap) {\n");
+    out.push_str("                size_t ncap = jgl_outcap * 2;\n");
+    out.push_str("                char *grown = (char *)realloc(jgl_out, ncap);\n");
+    out.push_str("                if (!grown) { free(jgl_out); jgl_out = NULL; break; }\n");
+    out.push_str("                jgl_out = grown;\n");
+    out.push_str("                jgl_outcap = ncap;\n");
+    out.push_str("            }\n");
+    out.push_str("            size_t got = fread(jgl_out + jgl_outlen, 1, jgl_outcap - jgl_outlen - 1, p);\n");
+    out.push_str("            jgl_outlen += got;\n");
+    out.push_str("            if (got == 0) break;\n");
+    out.push_str("        }\n");
+    out.push_str("        if (jgl_out) jgl_out[jgl_outlen] = '\\0';\n");
+    out.push_str("    }\n");
+    out.push_str("    jgl_status = pclose(p);\n");
+    out.push_str("    p = NULL;\n");
+    // The result is what follows the marker. Whatever the target printed
+    // besides is not part of it. The last occurrence of the marker is the
+    // one of the bridge: the bridge writes its value after everything the
+    // target printed, and the marker carries a nonce that the target does
+    // not know.
+    out.push_str("    const char *jgl_value = NULL;\n");
+    out.push_str("    if (jgl_out) {\n");
+    out.push_str(&format!(
+        "        const char *jgl_mark = strstr(jgl_out, \"{}\");\n",
+        c_escape(marker)
+    ));
+    out.push_str(&format!(
+        "        while (jgl_mark) {{ jgl_value = jgl_mark + strlen(\"{}\"); jgl_mark = strstr(jgl_value, \"{}\"); }}\n",
+        c_escape(marker),
+        c_escape(marker)
+    ));
+    out.push_str("    }\n");
+    if ret_c == "char*" {
+        // A text result is read whole, so that it may contain spaces, and it
+        // may be of any length. The buffer is allocated per call, so that
+        // two results held at the same time do not alias each other.
+        out.push_str("    char *result = (char *)malloc(jgl_outlen + 1);\n");
+        out.push_str("    if (!result) { free(jgl_out); return NULL; }\n");
+        out.push_str("    result[0] = '\\0';\n");
+        out.push_str("    if (jgl_value) {\n");
+        out.push_str("        size_t n = strlen(jgl_value);\n");
+        out.push_str("        memcpy(result, jgl_value, n + 1);\n");
+        out.push_str("        /* The bridge writes the value and one line break. That one line break belongs to the print, every other one is part of the value. */\n");
+        out.push_str("        if (n > 0 && result[n-1] == '\\n') { result[--n] = '\\0'; }\n");
+        out.push_str("    }\n");
+        out.push_str("    free(jgl_out);\n");
+    } else if ret_c == "void" {
+        out.push_str("    free(jgl_out);\n");
+    } else {
+        out.push_str(&format!("    {} result = 0;\n", ret_c));
+        out.push_str(&format!(
+            "    if (jgl_value && sscanf(jgl_value, \"%{}\", &result) != 1) {{ fprintf(stderr, \"JglBridge: the call returned a value that is not a number\\n\"); result = 0; }}\n",
+            c_return_scanfmt(ret_c)
+        ));
+        out.push_str("    free(jgl_out);\n");
+    }
+    // The status of the subprocess says whether the call went through. A
+    // call that failed is reported: the value it would have returned is
+    // not a value at all.
+    out.push_str("    if (jgl_status != 0) {\n");
+    out.push_str(&format!(
+        "        if (WIFEXITED(jgl_status)) fprintf(stderr, \"JglBridge: {} exited with status %d\\n\", WEXITSTATUS(jgl_status));\n",
+        runtime
+    ));
+    out.push_str(&format!(
+        "        else fprintf(stderr, \"JglBridge: {} was stopped by signal %d\\n\", WTERMSIG(jgl_status));\n",
+        runtime
+    ));
+    out.push_str("    }\n");
+    if ret_c != "void" {
+        out.push_str("    else if (!jgl_value) {\n");
+        out.push_str(
+            "        fprintf(stderr, \"JglBridge: the call did not return a value\\n\");\n",
+        );
+        out.push_str("    }\n");
+    }
+    out
+}
+
+// ===== JVM (Java / Kotlin / Scala) bridge =====
+
+/// The class of a Java type that wraps a primitive.
+///
+/// "Integer" is not "int", and the bridge has to hand the method the class
+/// it really asks for. The raw name tells the two apart, the normalised one
+/// does not.
+fn java_wrapper_class(raw_type: &str) -> Option<&'static str> {
+    match raw_type.trim() {
+        "Integer" => Some("Integer.class"),
+        "Long" => Some("Long.class"),
+        "Double" => Some("Double.class"),
+        "Float" => Some("Float.class"),
+        "Short" => Some("Short.class"),
+        "Byte" => Some("Byte.class"),
+        "Boolean" => Some("Boolean.class"),
+        "Character" => Some("Character.class"),
+        "String" => Some("String.class"),
+        _ => None,
+    }
+}
+
+/// The expression that turns the text of an argument into a Java value of
+/// the given wrapper type.
+fn java_wrapper_arg(raw_type: &str, idx: usize) -> Option<String> {
+    match raw_type.trim() {
+        "Integer" => Some(format!("Integer.valueOf(args[{}])", idx)),
+        "Long" => Some(format!("Long.valueOf(args[{}])", idx)),
+        "Short" => Some(format!("Short.valueOf(args[{}])", idx)),
+        "Byte" => Some(format!("Byte.valueOf(args[{}])", idx)),
+        "Boolean" => Some(format!(
+            "(\"1\".equals(args[{}]) || \"true\".equalsIgnoreCase(args[{}])) ? Boolean.TRUE : Boolean.FALSE",
+            idx, idx
+        )),
+        "Character" => Some(format!("args[{}].charAt(0)", idx)),
+        "Double" => Some(format!(
+            "Double.longBitsToDouble(Long.parseUnsignedLong(args[{}], 16))",
+            idx
+        )),
+        "Float" => Some(format!(
+            "(float) Double.longBitsToDouble(Long.parseUnsignedLong(args[{}], 16))",
+            idx
+        )),
+        "String" => Some(format!("args[{}]", idx)),
+        _ => None,
+    }
+}
+
+/// Java reflection type of a parameter.
+fn java_reflection_type(p: &Param) -> String {
+    if let Some(class) = java_wrapper_class(&p.raw_type) {
+        return class.to_string();
+    }
+    let raw = normalize_type_name(&p.raw_type);
+    if let Some(elem) = raw.strip_suffix("[]") {
+        return match elem {
+            "int" => "int[].class".to_string(),
+            "long" => "long[].class".to_string(),
+            "short" => "short[].class".to_string(),
+            "byte" => "byte[].class".to_string(),
+            "double" => "double[].class".to_string(),
+            "float" => "float[].class".to_string(),
+            "boolean" => "boolean[].class".to_string(),
+            "string" => "String[].class".to_string(),
+            _ => "Object[].class".to_string(),
+        };
+    }
+    match raw.as_str() {
+        "double" => "double.class".to_string(),
+        "float" => "float.class".to_string(),
+        "int" => "int.class".to_string(),
+        "long" => "long.class".to_string(),
+        "short" => "short.class".to_string(),
+        "byte" => "byte.class".to_string(),
+        "boolean" => "boolean.class".to_string(),
+        "char" => "char.class".to_string(),
+        "string" => "String.class".to_string(),
+        _ => match p.jgl_type {
+            JglType::Double => "double.class".to_string(),
+            JglType::Int => "long.class".to_string(),
+            JglType::String => "String.class".to_string(),
+            JglType::Bool => "boolean.class".to_string(),
+            JglType::Array => "Object[].class".to_string(),
+            JglType::Object => "Object.class".to_string(),
+        },
+    }
+}
+
+/// Java expression converting a command line argument to the parameter type.
+fn java_arg_expr(p: &Param, idx: usize) -> String {
+    if let Some(expr) = java_wrapper_arg(&p.raw_type, idx) {
+        return expr;
+    }
+    let raw = normalize_type_name(&p.raw_type);
+    if let Some(elem) = raw.strip_suffix("[]") {
+        // A collection travels as its comma separated text.
+        return match elem {
+            "int" => format!("jglInts(args[{}])", idx),
+            "long" => format!("jglLongs(args[{}])", idx),
+            "short" => format!("jglShorts(args[{}])", idx),
+            "byte" => format!("jglBytes(args[{}])", idx),
+            "double" => format!("jglDoubles(args[{}])", idx),
+            "float" => format!("jglFloats(args[{}])", idx),
+            "boolean" => format!("jglBools(args[{}])", idx),
+            "string" => format!("jglStrings(args[{}])", idx),
+            _ => format!("args[{}]", idx),
+        };
+    }
+    match raw.as_str() {
+        // A double travels as the hexadecimal digits of its bit pattern, so
+        // that every value survives, including the infinite ones and the
+        // not-a-numbers.
+        "double" => format!(
+            "Double.longBitsToDouble(Long.parseUnsignedLong(args[{}], 16))",
+            idx
+        ),
+        "float" => format!(
+            "(float) Double.longBitsToDouble(Long.parseUnsignedLong(args[{}], 16))",
+            idx
+        ),
+        "int" => format!("Integer.valueOf(args[{}])", idx),
+        "long" => format!("Long.valueOf(args[{}])", idx),
+        "short" => format!("Short.valueOf(args[{}])", idx),
+        "byte" => format!("Byte.valueOf(args[{}])", idx),
+        "boolean" => format!(
+            "(\"1\".equals(args[{}]) || \"true\".equalsIgnoreCase(args[{}])) ? Boolean.TRUE : Boolean.FALSE",
+            idx, idx
+        ),
+        "char" => format!("args[{}].charAt(0)", idx),
+        _ => match p.jgl_type {
+            JglType::Double => format!(
+                "Double.longBitsToDouble(Long.parseUnsignedLong(args[{}], 16))",
+                idx
+            ),
+            JglType::Int => format!("Long.valueOf(args[{}])", idx),
+            JglType::Bool => format!(
+                "(\"1\".equals(args[{}]) || \"true\".equalsIgnoreCase(args[{}])) ? Boolean.TRUE : Boolean.FALSE",
+                idx, idx
+            ),
+            _ => format!("args[{}]", idx),
+        },
+    }
+}
+
+/// The Java statement that prints the value a method returned.
+///
+/// A value that is not a number cannot be printed as one, so the bridge says
+/// so and leaves without a value.
+fn java_print_ret(kind: RetKind, method: &str, marker: &str) -> String {
+    match kind {
+        RetKind::Void => String::new(),
+        RetKind::Bool => format!(
+            "System.out.println(\"{}\" + (((Boolean) r) ? 1 : 0));",
+            marker
+        ),
+        RetKind::Int => format!("System.out.println(\"{}\" + r);", marker),
+        RetKind::Text => format!(
+            "System.out.print(\"{}\"); System.out.print(r); System.out.print(\"\\n\");",
+            marker
+        ),
+        RetKind::Float => format!(
+            "if (!(r instanceof Number)) {{ System.err.println(\"JglJavaBridge: method {m} returned a value that is not a number\"); System.exit(1); return; }}\nSystem.out.println(\"{k}\" + ((Number) r).doubleValue());",
+            m = method,
+            k = marker
+        ),
+    }
+}
+
+/// The helper methods the Java bridge uses to turn the comma separated text
+/// of a collection argument into an array.
+fn java_collection_helpers() -> String {
+    let mut out = String::new();
+    out.push_str("    private static String[] jglSplit(String s) {\n");
+    out.push_str("        if (s == null || s.isEmpty()) return new String[0];\n");
+    out.push_str("        return s.split(\",\", -1);\n");
+    out.push_str("    }\n");
+    for (name, jtype, parse) in [
+        ("jglDoubles", "double", "Double.parseDouble"),
+        ("jglFloats", "float", "Float.parseFloat"),
+        ("jglInts", "int", "Integer.parseInt"),
+        ("jglLongs", "long", "Long.parseLong"),
+        ("jglShorts", "short", "Short.parseShort"),
+        ("jglBytes", "byte", "Byte.parseByte"),
+    ] {
+        out.push_str(&format!(
+            "    private static {}[] {}(String s) {{\n        String[] parts = jglSplit(s);\n        {}[] out = new {}[parts.length];\n        for (int i = 0; i < parts.length; i++) out[i] = ({}) {}(parts[i].trim());\n        return out;\n    }}\n",
+            jtype, name, jtype, jtype, jtype, parse
+        ));
+    }
+    out.push_str("    private static boolean[] jglBools(String s) {\n        String[] parts = jglSplit(s);\n        boolean[] out = new boolean[parts.length];\n        for (int i = 0; i < parts.length; i++) out[i] = \"1\".equals(parts[i].trim()) || \"true\".equalsIgnoreCase(parts[i].trim());\n        return out;\n    }\n");
+    out.push_str("    private static String[] jglStrings(String s) {\n        String[] parts = jglSplit(s);\n        for (int i = 0; i < parts.length; i++) parts[i] = parts[i].trim();\n        return parts;\n    }\n");
+    out
+}
+
+/// The Java helper that finds the method a call refers to.
+///
+/// The declared parameter types are tried first. A generic parameter has no
+/// matching type at runtime, so the method is then looked up by its name and
+/// by its number of arguments.
+fn java_lookup_helper() -> String {
+    let mut out = String::new();
+    out.push_str("    private static Method jglFind(Class<?> cls, String name, Class<?>[] types, int count) {\n");
+    out.push_str("        try {\n");
+    out.push_str("            return cls.getMethod(name, types);\n");
+        out.push_str("        } catch (NoSuchMethodException e) {\n");
+        out.push_str("            Method found = null;\n");
+        out.push_str("            for (Method m : cls.getMethods()) {\n");
+        out.push_str("                if (!m.getName().equals(name)) continue;\n");
+        out.push_str("                if (m.getParameterTypes().length != count) continue;\n");
+        out.push_str("                if (found != null) return null;\n");
+        out.push_str("                found = m;\n");
+        out.push_str("            }\n");
+        // A method that is not public is not found by getMethod, so the
+        // methods the class declares itself are looked at as well.
+        out.push_str("            if (found == null) {\n");
+        out.push_str("                for (Method m : cls.getDeclaredMethods()) {\n");
+        out.push_str("                    if (!m.getName().equals(name)) continue;\n");
+        out.push_str("                    if (m.getParameterTypes().length != count) continue;\n");
+        out.push_str("                    if (found != null) return null;\n");
+        out.push_str("                    found = m;\n");
+        out.push_str("                }\n");
+        out.push_str("            }\n");
+        out.push_str("            if (found != null && !Modifier.isPublic(found.getModifiers())) {\n");
+        out.push_str("                try { found.setAccessible(true); } catch (RuntimeException ignored) { }\n");
+        out.push_str("            }\n");
+        out.push_str("            return found;\n");
+        out.push_str("        }\n");
+    out.push_str("    }\n");
+    out
+}
+
+/// Reflection dispatch block for a single method in the Java bridge.
+fn java_bridge_block(m: &FfiMethod, marker: &str) -> String {
+    let types: Vec<String> = m.sig.params.iter().map(java_reflection_type).collect();
+    let type_array = if types.is_empty() {
+        "new Class<?>[0]".to_string()
+    } else {
+        format!("new Class<?>[] {{ {} }}", types.join(", "))
+    };
+    let args: Vec<String> = m
+        .sig
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| java_arg_expr(p, i + 2))
+        .collect();
+    let arg_array = if args.is_empty() {
+        "new Object[0]".to_string()
+    } else {
+        format!("new Object[] {{ {} }}", args.join(", "))
+    };
+    format!(
+        "if (methodName.equals(\"{dispatch}\")) {{\nMethod m = jglFind(cls, \"{name}\", {types}, {count});\nif (m == null) {{ System.err.println(\"Method not found: \" + methodName); System.exit(1); return; }}\nif (!Modifier.isPublic(m.getDeclaringClass().getModifiers())) m.setAccessible(true);\nif (!Modifier.isStatic(m.getModifiers())) {{ System.err.println(\"JglJavaBridge: method {name} is not static and cannot be called from C\"); System.exit(1); return; }}\nObject r = m.invoke(null, {args});\n{print}return;\n}}\n",
+        dispatch = m.dispatch_name,
+        name = m.sig.name,
+        types = type_array,
+        count = m.sig.params.len(),
+        args = arg_array,
+        print = java_print_ret(ret_kind(&m.sig.return_type), &m.sig.name, marker)
+    )
+}
+
+/// Render the Java bridge source for the given classes.
+fn jvm_bridge_source(classes: &[JvmClass], marker: &str) -> String {
+    let mut out = String::new();
+    out.push_str("import java.lang.reflect.*;\n");
+    out.push_str("public class JglJavaBridge {\n");
+    out.push_str(&java_collection_helpers());
+    out.push_str(&java_lookup_helper());
+    out.push_str("    public static void main(String[] args) {\n");
+    out.push_str("        try {\n");
+    out.push_str("        String className = args[0];\n");
+    out.push_str("        String methodName = args[1];\n");
+    out.push_str("        Class<?> cls = Class.forName(className);\n");
+    for c in classes {
+        out.push_str(&format!("        if (className.equals(\"{}\")) {{\n", c.class_name));
+        for m in &c.methods {
+            out.push_str(&java_bridge_block(m, marker));
+        }
+        out.push_str("        }\n");
+    }
+    out.push_str("        System.err.println(\"Method not found: \" + methodName);\n");
+    out.push_str("        System.exit(1);\n");
+    out.push_str("        } catch (ClassNotFoundException e) {\n");
+    out.push_str("        System.err.println(\"Class not found: \" + args[0]);\n");
+    out.push_str("        System.exit(1);\n");
+    out.push_str("        } catch (InvocationTargetException e) {\n");
+    out.push_str("        Throwable cause = e.getCause() == null ? e : e.getCause();\n");
+    out.push_str("        System.err.println(\"JglJavaBridge: \" + cause.getClass().getSimpleName() + \": \" + cause.getMessage());\n");
+    out.push_str("        System.exit(1);\n");
+    out.push_str("        } catch (Exception e) {\n");
+    out.push_str("        System.err.println(\"JglJavaBridge: \" + e.getClass().getSimpleName() + \": \" + e.getMessage());\n");
+    out.push_str("        System.exit(1);\n");
+    out.push_str("        }\n");
+    out.push_str("    }\n");
+    out.push_str("}\n");
+    out
+}
+
+/// C stubs of the JVM bridge: the embedded JAR declaration plus one stub per
+/// method.
+fn jvm_c_stub_source(classes: &[JvmClass], marker: &str) -> String {
+    let mut out = c_bridge_preamble("FFI bridge for JVM methods");
+    out.push_str(SHELL_QUOTE_HELPER);
+    out.push_str(APPEND_HELPER);
+    if takes_double(classes.iter().flat_map(|c| c.methods.iter().copied())) {
+        out.push_str(DOUBLE_BITS_HELPER);
+    }
+    for c in classes {
+        let jar_path = format!("/tmp/_jgl_jvm_{}", c.jar_file);
+        out.push_str(&format!(
+            "extern const unsigned char {}_data[]; extern const uint32_t {}_len;\n",
+            c.jar_symbol, c.jar_symbol
+        ));
+        for m in &c.methods {
+            let ret_c = c_return_type(&m.sig.return_type);
+            let params = build_c_params(&m.sig);
+            let args = shell_cmd_args(&m.sig);
+            // A method that cannot be called is reported instead of being
+            // called: the call would fail in a way the caller cannot use.
+            if let Some(reason) = &m.sig.not_callable {
+                out.push_str(&not_callable_stub(&ret_c, &m.sym, &params, reason));
+                out.push('\n');
+                continue;
+            }
+            let preamble = format!(
+                "    FILE *tf = fopen(\"{}\", \"wb\");\n    if (tf) {{ fwrite({}_data, 1, {}_len, tf); fclose(tf); }}\n{}{}",
+                jar_path,
+                c.jar_symbol,
+                c.jar_symbol,
+                cmd_arg_bufs(&args),
+                build_shell_arg_list(&args, &ret_c)
+            );
+            let cmd = CmdLine {
+                literals: vec![
+                    ("java".to_string(), false),
+                    ("-cp".to_string(), false),
+                    (jar_path.clone(), false),
+                    ("JglJavaBridge".to_string(), false),
+                    (c.class_name.clone(), true),
+                    (m.dispatch_name.clone(), true),
+                ],
+                runtime: vec![],
+                arglist: !args.is_empty(),
+            };
+            out.push_str(&c_stub_body(
+                &ret_c, &m.sym, &params, &preamble, None, &cmd, marker,
+            ));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+// ===== C# bridge =====
+
+/// C# reflection type of a parameter.
+fn cs_reflection_type(p: &Param) -> String {
+    let raw = normalize_type_name(&p.raw_type);
+    if let Some(elem) = raw.strip_suffix("[]") {
+        return match elem {
+            "int" => "typeof(int[])".to_string(),
+            "long" => "typeof(long[])".to_string(),
+            "short" => "typeof(short[])".to_string(),
+            "byte" => "typeof(byte[])".to_string(),
+            "double" => "typeof(double[])".to_string(),
+            "float" => "typeof(float[])".to_string(),
+            "bool" => "typeof(bool[])".to_string(),
+            "string" => "typeof(string[])".to_string(),
+            _ => "typeof(object[])".to_string(),
+        };
+    }
+    match raw.as_str() {
+        "double" => "typeof(double)".to_string(),
+        "float" => "typeof(float)".to_string(),
+        "int" => "typeof(int)".to_string(),
+        "long" => "typeof(long)".to_string(),
+        "short" => "typeof(short)".to_string(),
+        "byte" => "typeof(byte)".to_string(),
+        "bool" => "typeof(bool)".to_string(),
+        "string" => "typeof(string)".to_string(),
+        "char" => "typeof(char)".to_string(),
+        _ => match p.jgl_type {
+            JglType::Double => "typeof(double)".to_string(),
+            JglType::Int => "typeof(long)".to_string(),
+            JglType::String => "typeof(string)".to_string(),
+            JglType::Bool => "typeof(bool)".to_string(),
+            JglType::Array => "typeof(object[])".to_string(),
+            JglType::Object => "typeof(object)".to_string(),
+        },
+    }
+}
+
+/// C# expression converting a command line argument to the parameter type.
+fn cs_arg_expr(p: &Param, idx: usize) -> String {
+    let raw = normalize_type_name(&p.raw_type);
+    if let Some(elem) = raw.strip_suffix("[]") {
+        // A collection travels as its comma separated text.
+        return match elem {
+            "int" => format!("JlInts(args[{}])", idx),
+            "long" => format!("JlLongs(args[{}])", idx),
+            "short" => format!("JlShorts(args[{}])", idx),
+            "byte" => format!("JlBytes(args[{}])", idx),
+            "double" => format!("JlDoubles(args[{}])", idx),
+            "float" => format!("JlFloats(args[{}])", idx),
+            "bool" => format!("JlBools(args[{}])", idx),
+            "string" => format!("JlStrings(args[{}])", idx),
+            _ => format!("args[{}]", idx),
+        };
+    }
+    match raw.as_str() {
+        // A double travels as the hexadecimal digits of its bit pattern, so
+        // that every value survives, including the infinite ones and the
+        // not-a-numbers.
+        "double" => format!(
+            "BitConverter.Int64BitsToDouble((long)ulong.Parse(args[{}], NumberStyles.HexNumber))",
+            idx
+        ),
+        "float" => format!(
+            "(float)BitConverter.Int64BitsToDouble((long)ulong.Parse(args[{}], NumberStyles.HexNumber))",
+            idx
+        ),
+        "int" => format!("int.Parse(args[{}], CultureInfo.InvariantCulture)", idx),
+        "long" => format!("long.Parse(args[{}], CultureInfo.InvariantCulture)", idx),
+        "short" => format!("short.Parse(args[{}], CultureInfo.InvariantCulture)", idx),
+        "byte" => format!("byte.Parse(args[{}], CultureInfo.InvariantCulture)", idx),
+        "bool" => format!(
+            "bool.Parse((\"1\".Equals(args[{}]) || string.Equals(\"true\", args[{}], StringComparison.OrdinalIgnoreCase)) ? \"true\" : \"false\")",
+            idx, idx
+        ),
+        "char" => format!("args[{}][0]", idx),
+        _ => match p.jgl_type {
+            JglType::Double => format!(
+                "BitConverter.Int64BitsToDouble((long)ulong.Parse(args[{}], NumberStyles.HexNumber))",
+                idx
+            ),
+            JglType::Int => format!("long.Parse(args[{}], CultureInfo.InvariantCulture)", idx),
+            JglType::Bool => format!(
+                "bool.Parse((\"1\".Equals(args[{}]) || string.Equals(\"true\", args[{}], StringComparison.OrdinalIgnoreCase)) ? \"true\" : \"false\")",
+                idx, idx
+            ),
+            _ => format!("args[{}]", idx),
+        },
+    }
+}
+
+/// The C# statement that prints the value a method returned.
+///
+/// A value that is not a number cannot be printed as one, so the bridge says
+/// so and leaves without a value.
+fn cs_print_ret(kind: RetKind, var: &str, method: &str, marker: &str) -> String {
+    match kind {
+        RetKind::Void => String::new(),
+        RetKind::Bool => format!(
+            "Console.WriteLine(\"{}\" + (((bool) {v}) ? 1 : 0));",
+            marker,
+            v = var
+        ),
+        RetKind::Int => format!("Console.WriteLine(\"{}\" + {v});", marker, v = var),
+        RetKind::Text => format!(
+            "Console.Write(\"{}\"); Console.Write({v}); Console.Write(\"\\n\");",
+            marker,
+            v = var
+        ),
+        RetKind::Float => format!(
+            "double d;\ntry {{ d = Convert.ToDouble({v}, CultureInfo.InvariantCulture); }}\ncatch (Exception) {{ Console.Error.WriteLine(\"JglCsBridge: method {m} returned a value that is not a number\"); Environment.Exit(1); return; }}\nConsole.WriteLine(\"{k}\" + d.ToString(\"R\", CultureInfo.InvariantCulture));",
+            v = var,
+            m = method,
+            k = marker
+        ),
+    }
+}
+
+/// The helper methods the C# bridge uses to turn the comma separated text
+/// of a collection argument into an array.
+fn cs_collection_helpers() -> String {
+    let mut out = String::new();
+    out.push_str("    static string[] JlSplit(string s) { return (s ?? \"\").Split(','); }\n");
+    for (name, jtype, parse) in [
+        ("JlDoubles", "double", "double.Parse"),
+        ("JlFloats", "float", "float.Parse"),
+        ("JlInts", "int", "int.Parse"),
+        ("JlLongs", "long", "long.Parse"),
+        ("JlShorts", "short", "short.Parse"),
+        ("JlBytes", "byte", "byte.Parse"),
+    ] {
+        out.push_str(&format!(
+            "    static {0}[] {1}(string s) {{ string[] p = JlSplit(s); {0}[] o = new {0}[p.Length]; for (int i = 0; i < p.Length; i++) o[i] = ({0}) {2}(p[i].Trim(), CultureInfo.InvariantCulture); return o; }}\n",
+            jtype, name, parse
+        ));
+    }
+    out.push_str("    static bool[] JlBools(string s) { string[] p = JlSplit(s); bool[] o = new bool[p.Length]; for (int i = 0; i < p.Length; i++) o[i] = \"1\".Equals(p[i].Trim()) || string.Equals(\"true\", p[i].Trim(), StringComparison.OrdinalIgnoreCase); return o; }\n");
+    out.push_str("    static string[] JlStrings(string s) { string[] p = JlSplit(s); for (int i = 0; i < p.Length; i++) p[i] = p[i].Trim(); return p; }\n");
+    out
+}
+
+/// The C# helper that finds the method a call refers to.
+///
+/// The declared parameter types are tried first. A generic parameter has no
+/// matching type at runtime, so the method is then looked up by its name and
+/// by its number of arguments.
+fn cs_lookup_helper() -> String {
+    let mut out = String::new();
+    out.push_str("    static MethodInfo jglFind(Type cls, string name, Type[] types, int count) {\n");
+    // A method that is not public is not found by the default lookup, so
+    // every method of the type is looked at.
+    out.push_str("        MethodInfo mi = cls.GetMethod(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance, null, types, null);\n");
+    out.push_str("        if (mi != null) return mi;\n");
+    out.push_str("        MethodInfo found = null;\n");
+    out.push_str("        foreach (MethodInfo m in cls.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance)) {\n");
+    out.push_str("            if (m.Name != name) continue;\n");
+    out.push_str("            if (m.GetParameters().Length != count) continue;\n");
+    out.push_str("            if (found != null) return null;\n");
+    out.push_str("            found = m;\n");
+    out.push_str("        }\n");
+    out.push_str("        return found;\n");
+    out.push_str("    }\n");
+    out.push_str("    static string JlStripArity(string name) { int tick = name.IndexOf('`'); return tick >= 0 ? name.Substring(0, tick) : name; }\n");
+    out
+}
+
+/// Reflection dispatch block for a single method in the C# bridge.
+fn cs_bridge_block(m: &FfiMethod, marker: &str) -> String {
+    let types: Vec<String> = m.sig.params.iter().map(cs_reflection_type).collect();
+    let type_array = if types.is_empty() {
+        "new Type[0]".to_string()
+    } else {
+        format!("new Type[] {{ {} }}", types.join(", "))
+    };
+    let args: Vec<String> = m
+        .sig
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| cs_arg_expr(p, i + 3))
+        .collect();
+    let arg_array = if args.is_empty() {
+        "new object[0]".to_string()
+    } else {
+        format!("new object[] {{ {} }}", args.join(", "))
+    };
+    let ret = cs_return(&m.sig.return_type);
+    // The lookup is checked before it is used: .NET answers a lookup that
+    // matches nothing with a null reference, and calling through it would
+    // raise a null reference exception of its own.
+    // A property is read through its getter.
+    let lookup_name = if m.sig.property {
+        format!("get_{}", m.sig.name)
+    } else {
+        m.sig.name.clone()
+    };
+    let lookup = format!(
+        "MethodInfo mi = jglFind(cls, \"{name}\", {types}, {count});\nif (mi == null) {{ Console.Error.WriteLine(\"Method not found: \" + methodName); Environment.Exit(1); return; }}\nif (!mi.IsStatic) {{ Console.Error.WriteLine(\"JglCsBridge: method {own} is not static and cannot be called from C\"); Environment.Exit(1); return; }}\n",
+        name = lookup_name,
+        own = m.sig.name,
+        types = type_array,
+        count = m.sig.params.len(),
+    );
+    // A method that returns a task is awaited before its value is read: the
+    // value the C caller sees is the one the task carries.
+    let (call, var) = match &ret {
+        CsRet::Task(_, inner) => (
+            format!(
+                "{lookup}object r = mi.Invoke(null, {args});\nobject v = r;\nif (r is Task) {{ ((Task)r).GetAwaiter().GetResult(); v = ((Task<{inner}>)r).Result; }}\n",
+                lookup = lookup,
+                args = arg_array,
+                inner = inner,
+            ),
+            "v",
+        ),
+        CsRet::TaskVoid => (
+            format!(
+                "{lookup}object r = mi.Invoke(null, {args});\nif (r is Task) {{ ((Task)r).GetAwaiter().GetResult(); }}\n",
+                lookup = lookup,
+                args = arg_array,
+            ),
+            "r",
+        ),
+        CsRet::Value(_) => (
+            format!(
+                "{lookup}object r = mi.Invoke(null, {args});\n",
+                lookup = lookup,
+                args = arg_array,
+            ),
+            "r",
+        ),
+    };
+    format!(
+        "if (methodName == \"{dispatch}\") {{\n{call}{print}return;\n}}\n",
+        dispatch = m.dispatch_name,
+        call = call,
+        print = cs_print_ret(ffi_ret_kind(m), var, &m.sig.name, marker)
+    )
+}
+
+/// Render the C# bridge source for the given classes.
+fn cs_bridge_source(classes: &[(String, Vec<&FfiMethod>)], marker: &str) -> String {
+    let mut out = String::new();
+    out.push_str("using System;\n");
+    out.push_str("using System.Linq;\n");
+    out.push_str("using System.Reflection;\n");
+    out.push_str("using System.Globalization;\n");
+    out.push_str("using System.Threading.Tasks;\n");
+    out.push_str("public class JglCsBridge {\n");
+    out.push_str(&cs_collection_helpers());
+    out.push_str(&cs_lookup_helper());
+    out.push_str(&cs_type_arguments_helper());
+    out.push_str("    public static void Main(string[] args) {\n");
+    out.push_str("        try {\n");
+    out.push_str("            string dllPath = args[0];\n");
+    out.push_str("            string className = args[1];\n");
+    out.push_str("            string methodName = args[2];\n");
+    out.push_str("            var asm = Assembly.LoadFrom(dllPath);\n");
+    out.push_str(
+        "            Type cls = asm.GetType(className) ?? asm.GetTypes().FirstOrDefault(t => t.FullName == className);\n",
+    );
+    out.push_str("            if (cls == null) {\n");
+    out.push_str("                string simple = className;\n");
+    out.push_str("                int dot = className.LastIndexOf('.');\n");
+    out.push_str("                if (dot >= 0) simple = className.Substring(dot + 1);\n");
+    // A generic type carries its arity in its name: "Gen`1" is the name of
+    // "Gen<T>". Only the name without the arity is compared. A name that
+    // several types share is not a name that identifies a type, so it is
+    // refused instead of picking one of them.
+    out.push_str("                var candidates = asm.GetTypes().Where(t => JlStripArity(t.Name) == simple).ToList();\n");
+    out.push_str("                if (candidates.Count == 1) cls = candidates[0];\n");
+    out.push_str("                else if (candidates.Count > 1) {\n");
+    out.push_str("                    Console.Error.WriteLine(\"Class \" + className + \" is ambiguous: \" + candidates.Count + \" types carry that name\");\n");
+    out.push_str("                    Environment.Exit(1);\n");
+    out.push_str("                    return;\n");
+    out.push_str("                }\n");
+    out.push_str("            }\n");
+    out.push_str("            if (cls == null) {\n");
+    out.push_str("                Console.Error.WriteLine(\"Class not found: \" + className);\n");
+    out.push_str("                Environment.Exit(1);\n");
+    out.push_str("                return;\n");
+    out.push_str("            }\n");
+    // A generic type has to be closed before its methods can be called: a
+    // method of a type that still has type parameters cannot be called
+    // late. The type arguments are taken from the types of the arguments
+    // of the method, and a number stands in for a type argument that no
+    // argument names.
+    out.push_str("            if (cls.ContainsGenericParameters) {\n");
+    out.push_str("                cls = cls.MakeGenericType(JlTypeArguments(cls, methodName));\n");
+    out.push_str("            }\n");
+    for (class_name, methods) in classes {
+        out.push_str(&format!("if (className == \"{}\") {{\n", class_name));
+        for m in methods {
+            out.push_str(&cs_bridge_block(m, marker));
+        }
+        out.push_str("}\n");
+    }
+
+    out.push_str("        Console.Error.WriteLine(\"Method not found: \" + methodName);\n");
+    out.push_str("        Environment.Exit(1);\n");
+    out.push_str("        } catch (Exception e) {\n");
+    out.push_str("            Exception inner = e;\n");
+    out.push_str("            if (e is TargetInvocationException && ((TargetInvocationException)e).InnerException != null) inner = ((TargetInvocationException)e).InnerException;\n");
+    out.push_str("            if (e is AggregateException && ((AggregateException)e).InnerExceptions.Count > 0) inner = ((AggregateException)e).InnerExceptions[0];\n");
+    out.push_str("            Console.Error.WriteLine(\"JglCsBridge: \" + inner.GetType().Name + \": \" + inner.Message);\n");
+    out.push_str("            Environment.Exit(1);\n");
+    out.push_str("        }\n");
+    out.push_str("    }\n");
+    out.push_str("}\n");
+    out
+}
+
+/// The C# helper that closes a generic type.
+///
+/// The type arguments are taken from the types of the arguments of the
+/// method that is called, and a number stands in for a type argument that
+/// no argument names.
+fn cs_type_arguments_helper() -> String {
+    let mut out = String::new();
+    out.push_str("    static Type[] JlTypeArguments(Type cls, string methodName) {\n");
+    out.push_str("        int n = cls.GetGenericArguments().Length;\n");
+    out.push_str("        Type[] args = new Type[n];\n");
+    out.push_str("        MethodInfo any = cls.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance).FirstOrDefault(m => m.Name == methodName);\n");
+    out.push_str("        ParameterInfo[] ps = any != null ? any.GetParameters() : new ParameterInfo[0];\n");
+    out.push_str("        for (int i = 0; i < n; i++) {\n");
+    out.push_str("            Type t = i < ps.Length ? ps[i].ParameterType : typeof(double);\n");
+    out.push_str("            if (t.IsByRef) t = t.GetElementType();\n");
+    out.push_str("            args[i] = t;\n");
+    out.push_str("        }\n");
+    out.push_str("        return args;\n");
+    out.push_str("    }\n");
+    out
+}
+
+/// C stubs of the C# bridge for the given classes.
+fn cs_c_stub_source(classes: &[(String, Vec<&FfiMethod>)], marker: &str) -> String {
+    let mut out = c_bridge_preamble("FFI bridge for C# methods");
+    out.push_str(SHELL_QUOTE_HELPER);
+    out.push_str(APPEND_HELPER);
+    if takes_double(classes.iter().flat_map(|(_, methods)| methods.iter().copied())) {
+        out.push_str(DOUBLE_BITS_HELPER);
+    }
+    out.push_str("extern const unsigned char jgl_cs_dll_data[]; extern const uint32_t jgl_cs_dll_len;\n");
+    out.push_str("extern const unsigned char jgl_cs_bridge_dll_data[]; extern const uint32_t jgl_cs_bridge_dll_len;\n");
+    out.push_str("extern const unsigned char jgl_cs_bridge_runtimeconfig_json_data[]; extern const uint32_t jgl_cs_bridge_runtimeconfig_json_len;\n\n");
+    for (class_name, methods) in classes {
+        for m in methods {
+            let ret_c = c_return_type_kind(ffi_ret_kind(m));
+            let params = build_c_params(&m.sig);
+            // A method that cannot be called is reported instead of being
+            // called: the call would fail in a way the caller cannot use.
+            if let Some(reason) = &m.sig.not_callable {
+                out.push_str(&not_callable_stub(&ret_c, &m.sym, &params, reason));
+                out.push('\n');
+                continue;
+            }
+            let args = shell_cmd_args(&m.sig);
+            // The path the stub writes the DLL to is the path the command
+            // hands to the bridge.
+            let dll_path = format!("/tmp/_jgl_cs_{}.dll", m.sym);
+            let preamble = format!(
+                "    FILE *tf = fopen(\"{}\", \"wb\");\n    if (tf) {{ fwrite(jgl_cs_dll_data, 1, jgl_cs_dll_len, tf); fclose(tf); }}\n    FILE *bf = fopen(\"/tmp/_jgl_cs_bridge.dll\", \"wb\");\n    if (bf) {{ fwrite(jgl_cs_bridge_dll_data, 1, jgl_cs_bridge_dll_len, bf); fclose(bf); }}\n    FILE *rf = fopen(\"/tmp/_jgl_cs_bridge.runtimeconfig.json\", \"w\");\n    if (rf) {{ fwrite(jgl_cs_bridge_runtimeconfig_json_data, 1, jgl_cs_bridge_runtimeconfig_json_len, rf); fclose(rf); }}\n{}{}",
+                dll_path,
+                cmd_arg_bufs(&args),
+                build_shell_arg_list(&args, &ret_c)
+            );
+            let cmd = CmdLine {
+                literals: vec![
+                    ("dotnet".to_string(), false),
+                    ("/tmp/_jgl_cs_bridge.dll".to_string(), false),
+                    (dll_path.clone(), false),
+                    (class_name.clone(), true),
+                    (m.dispatch_name.clone(), true),
+                ],
+                runtime: vec![],
+                arglist: !args.is_empty(),
+            };
+            out.push_str(&c_stub_body(
+                &ret_c, &m.sym, &params, &preamble, None, &cmd, marker,
+            ));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+// ===== Scripting language bridges (Python / Lua / TypeScript / JavaScript) =====
+
+/// The source files a set of methods comes from, in the order they appear.
+fn source_files(methods: &[&FfiMethod]) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    for m in methods {
+        if !files.contains(&m.file) {
+            files.push(m.file.clone());
+        }
+    }
+    files
+}
+
+/// Generate the C stubs calling into the embedded Python sources.
+fn py_c_stub_source(methods: &[&FfiMethod], marker: &str) -> String {
+    let mut out = c_bridge_preamble("FFI bridge for Python methods");
+    out.push_str(SHELL_QUOTE_HELPER);
+    out.push_str(APPEND_HELPER);
+    if takes_double(methods.iter().copied()) {
+        out.push_str(DOUBLE_BITS_HELPER);
+    }
+    for file in source_files(methods) {
+        let sym = payload_symbol("py", &file);
+        out.push_str(&format!(
+            "extern const unsigned char {}_data[]; extern const uint32_t {}_len;\n",
+            sym, sym
+        ));
+        for m in methods.iter().filter(|m| m.file == file) {
+            let ret_c = c_return_type(&m.sig.return_type);
+            let params = build_c_params(&m.sig);
+            let args = shell_cmd_args(&m.sig);
+            let needs_json = m
+                .sig
+                .params
+                .iter()
+                .any(|p| matches!(p.jgl_type, JglType::Array | JglType::Object));
+            // A double is rebuilt from the hexadecimal digits of its bit
+            // pattern, so the module that does it is needed.
+            let needs_struct = m.sig.params.iter().any(|p| p.jgl_type == JglType::Double);
+            let mut imports = vec!["sys"];
+            if needs_json {
+                imports.push("json");
+            }
+            if needs_struct {
+                imports.push("struct");
+            }
+            if m.sig.py.coroutine {
+                imports.push("asyncio");
+            }
+            let prelude = format!("import {}", imports.join(", "));
+            let temp = temp_script_path("py", &m.sym);
+            let program = if let Some(reason) = &m.sig.not_callable {
+                // A method that cannot be called is reported instead of
+                // being called: the call would fail in a way the caller
+                // cannot use.
+                format!(
+                    "{}\nsys.stderr.write(\"JglBridge: {}\\n\")\nsys.exit(1)",
+                    prelude,
+                    py_quote(reason)
+                )
+            } else {
+                let (positional, keyword) = py_call_args(&m.sig);
+                let call = py_call_expr(m, positional.len(), !keyword.is_empty());
+                let stmt = match ret_kind(&m.sig.return_type) {
+                    // A void method still has to run, so the call is made
+                    // and its result is thrown away.
+                    RetKind::Void => format!("{}", call),
+                    RetKind::Bool => {
+                        format!("_jgl_print(\"{}\" + _jgl_int(_jgl_int({})))", marker, call)
+                    }
+                    _ => format!("_jgl_print(\"{}\" + _jgl_str({}))", marker, call),
+                };
+                // A name that is declared more than once in a class is
+                // shadowed by the later declaration: the class holds the
+                // last one only. The earlier one is reached through the
+                // definition the module made of it.
+                if m.definition_count > 1
+                    && m.definition_index + 1 < m.definition_count
+                    && m.py_kind != "instance"
+                {
+                    let qualname = match &m.sig.qualifier {
+                        Some(q) => format!("{}.{}", q, m.sig.name),
+                        None => m.sig.name.clone(),
+                    };
+                    // The kind tells the definitions of the name apart. Only
+                    // a static method and a class method are among the
+                    // definitions the module kept.
+                    let kind = m.py_kind;
+                    // A class method is called with the class as its first
+                    // argument, the way the interpreter calls it. The class
+                    // is named after the module has run, so it cannot be
+                    // part of the arguments that are read before.
+                    let mut args: Vec<String> = Vec::new();
+                    if kind == "class" {
+                        if let Some(class) = &m.sig.qualifier {
+                            args.push(class.clone());
+                        }
+                    }
+                    for i in 0..positional.len() {
+                        args.push(format!("_jgl_args[{}]", i));
+                    }
+                    // A single argument needs a comma of its own, so that
+                    // the list is a tuple and not the value itself.
+                    let args = if args.len() == 1 {
+                        format!("{},", args[0])
+                    } else {
+                        args.join(", ")
+                    };
+                    let stmt = format!(
+                        "_jgl_print(\"{}\" + _jgl_str(_jgl_call(\"{}\", \"{}\", {}, ({}), _jgl_kwargs)))",
+                        marker, qualname, kind, m.kind_index, args
+                    );
+                    py_program(&prelude, &temp, &stmt, &positional, &keyword, true)
+                } else {
+                    py_program(&prelude, &temp, &stmt, &positional, &keyword, false)
+                }
+            };
+            let preamble = format!(
+                "    FILE *tf = fopen(\"{}\", \"w\");\n    if (tf) {{ fwrite({}_data, 1, {}_len, tf); fclose(tf); }}\n{}{}",
+                temp,
+                sym,
+                sym,
+                cmd_arg_bufs(&args),
+                build_shell_arg_list(&args, &ret_c)
+            );
+            let cmd = CmdLine {
+                literals: vec![
+                    ("python3".to_string(), false),
+                    ("-c".to_string(), false),
+                ],
+                runtime: vec![CmdWord {
+                    expr: "prog".to_string(),
+                    quote: true,
+                }],
+                arglist: !args.is_empty(),
+            };
+            out.push_str(&c_stub_body(
+                &ret_c,
+                &m.sym,
+                &params,
+                &preamble,
+                Some(Program {
+                    prelude: "",
+                    literal: &program,
+                    format: None,
+                    args: "",
+                    suffix: "",
+                    cleanup: "",
+                }),
+                &cmd,
+                marker,
+            ));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Generate the C stubs calling into the embedded Lua sources.
+fn lua_c_stub_source(methods: &[&FfiMethod], marker: &str) -> String {
+    let mut out = c_bridge_preamble("FFI bridge for Lua methods");
+    out.push_str(SHELL_QUOTE_HELPER);
+    out.push_str(APPEND_HELPER);
+    out.push_str(LUA_QUOTE_HELPER);
+    out.push_str(LUA_BOOL_HELPER);
+    if takes_double(methods.iter().copied()) {
+        out.push_str(DOUBLE_BITS_HELPER);
+    }
+    for file in source_files(methods) {
+        let sym = payload_symbol("lua", &file);
+        out.push_str(&format!(
+            "extern const unsigned char {}_data[]; extern const uint32_t {}_len;\n",
+            sym, sym
+        ));
+        for m in methods.iter().filter(|m| m.file == file) {
+            let ret_c = c_return_type(&m.sig.return_type);
+            let params = build_c_params(&m.sig);
+            let lua_args = lua_cmd_args(&m.sig);
+            // The argument values are embedded in the Lua source itself: Lua
+            // never has to interpret a command line argument. The file is
+            // loaded with dofile so that a module table works as well as a
+            // global function.
+            let call = build_lua_call_args(&m.sig);
+            // The program is split into a literal part, which may contain any
+            // character, and the argument list, which carries the format
+            // specifiers of the embedded values.
+            let temp = temp_script_path("lua", &m.sym);
+            // The function is looked up in the module table the file returns,
+            // in the global table and through the path it was declared with,
+            // so that "function M.f(x)" is found as well.
+            let lookup = lua_lookup_expr(&m.sig);
+            // A method declared with the colon syntax, "function M:f(x)", is
+            // "function M.f(M, x)": it takes the table as its first
+            // argument. The table is a global in the source file, so it is
+            // reached through the global table. When the file publishes the
+            // table as its module, the module table is that very table.
+            let receiver = match &m.sig.receiver_table {
+                Some(t) => format!("(_G.{} or mod)", t),
+                None => String::new(),
+            };
+            // The call opens with the function and, when the method takes a
+            // receiver, with the table it is called on. The table is the
+            // bridge's business, so the caller does not pass it.
+            let open = if receiver.is_empty() {
+                "fn(".to_string()
+            } else if call.args.trim().is_empty() {
+                format!("fn({}", receiver)
+            } else {
+                format!("fn({}, ", receiver)
+            };
+            // The print of the bridge is taken before the module runs, so
+            // that a module with a print of its own cannot take it away.
+            let head = format!(
+                "local __jgl_print = print; local ok, res = pcall(dofile, \"{}\"); local mod = (type(res) == \"table\") and res or _G; local fn = {}; if fn == nil then error(\"function not found\") end;",
+                temp, lookup
+            );
+            let (prefix, suffix) = match ret_kind(&m.sig.return_type) {
+                // A void method still has to run, so the call is made and its
+                // result is thrown away.
+                RetKind::Void => (format!("{}{}", head, open), ")".to_string()),
+                RetKind::Bool => (
+                    format!("{}{}__jgl_print(\"{}\" .. ((", head, open, marker),
+                    ") and 1 or 0))".to_string(),
+                ),
+                RetKind::Text => (
+                    format!("{}local v = {}", head, open),
+                    format!("); __jgl_print(\"{}\" .. tostring(v))", marker),
+                ),
+                _ => (
+                    format!("{}local v = {}", head, open),
+                    // A value that is not a number cannot be handed to C, so
+                    // the bridge says so instead of returning a value that
+                    // is not one. The value is printed with seventeen digits,
+                    // so that it crosses the bridge exactly, whatever the
+                    // default format of the Lua version happens to be.
+                    format!(
+                        "); if type(v) ~= \"number\" then error(\"JglLuaBridge: the method {name} returned a value that is not a number\") end; __jgl_print(\"{}\" .. string.format(\"%.17g\", v))",
+                        marker,
+                        name = m.sig.name
+                    ),
+                ),
+            };
+            // A double is embedded as the hexadecimal digits of its bit
+            // pattern, so the helper that rebuilds it is part of the program.
+            let prefix = if m.sig.params.iter().any(|p| p.jgl_type == JglType::Double) {
+                format!("{}{}", LUA_DOUBLE_HELPER, prefix)
+            } else {
+                prefix
+            };
+            // The Lua string arguments are escaped into buffers that are
+            // allocated before the program is built and released after it
+            // has run.
+            let preamble = format!(
+                "    FILE *tf = fopen(\"{}\", \"w\");\n    if (tf) {{ fwrite({}_data, 1, {}_len, tf); fclose(tf); }}\n{}",
+                temp,
+                sym,
+                sym,
+                cmd_arg_bufs(&lua_args)
+            );
+            let cmd = CmdLine {
+                literals: vec![
+                    ("lua".to_string(), false),
+                    ("-e".to_string(), false),
+                ],
+                runtime: vec![CmdWord {
+                    expr: "prog".to_string(),
+                    quote: true,
+                }],
+                arglist: false,
+            };
+            out.push_str(&c_stub_body(
+                &ret_c,
+                &m.sym,
+                &params,
+                &preamble,
+                Some(Program {
+                    prelude: &call.prelude,
+                    literal: &prefix,
+                    format: Some(&call.format),
+                    args: &call.args,
+                    suffix: &suffix,
+                    cleanup: &call.cleanup,
+                }),
+                &cmd,
+                marker,
+            ));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Generate the C stubs calling into the precompiled TypeScript sources or
+/// the embedded JavaScript sources.
+fn node_c_stub_source(lang: &str, methods: &[&FfiMethod], marker: &str) -> String {
+    let mut out = c_bridge_preamble(&format!("FFI bridge for {} methods", lang));
+    out.push_str(SHELL_QUOTE_HELPER);
+    out.push_str(APPEND_HELPER);
+    if takes_double(methods.iter().copied()) {
+        out.push_str(DOUBLE_BITS_HELPER);
+    }
+    for file in source_files(methods) {
+        let sym = payload_symbol(lang, &file);
+        out.push_str(&format!(
+            "extern const unsigned char {}_data[]; extern const uint32_t {}_len;\n",
+            sym, sym
+        ));
+        for m in methods.iter().filter(|m| m.file == file) {
+            let ret_c = c_return_type(&m.sig.return_type);
+            let params = build_c_params(&m.sig);
+            let args = shell_cmd_args(&m.sig);
+            let call = format!("fn({})", build_ts_args(&m.sig));
+            let stmt = match ret_kind(&m.sig.return_type) {
+                // A void method still has to run, so the call is made and its
+                // result is thrown away.
+                RetKind::Void => format!("{}", call),
+                RetKind::Bool => format!("console.log(\"{}\" + Number({}))", marker, call),
+                _ => format!("console.log(\"{}\" + ({}))", marker, call),
+            };
+            let temp = temp_script_path(lang, &m.sym);
+            // A default export is published under the name "default", so the
+            // lookup has to try that name first. The name of a function may
+            // be a path: a function of a namespace is reached through the
+            // namespace, and a static method of a class through the class.
+            let own = node_lookup_expr("m", &m.sig.call_expr);
+            let global_own = node_lookup_expr("globalThis", &m.sig.call_expr);
+            let lookup = match &m.sig.alt_call_expr {
+                Some(alt) => format!(
+                    "(m && m.{alt}) || ({own}) || (globalThis && globalThis.{alt}) || ({global_own})",
+                    alt = alt,
+                    own = own,
+                    global_own = global_own
+                ),
+                None => format!("({own}) || ({global_own})", own = own, global_own = global_own),
+            };
+            // A double arrives as the hexadecimal digits of its bit pattern,
+            // so the helper that rebuilds it is part of the program.
+            let helper = if m.sig.params.iter().any(|p| p.jgl_type == JglType::Double) {
+                TS_DOUBLE_HELPER
+            } else {
+                ""
+            };
+            let program = format!(
+                "{}const m = require(\"{}\"); const fn = {}; {}",
+                helper, temp, lookup, stmt
+            );
+            let preamble = format!(
+                "    FILE *tf = fopen(\"{}\", \"w\");\n    if (tf) {{ fwrite({}_data, 1, {}_len, tf); fclose(tf); }}\n{}{}",
+                temp,
+                sym,
+                sym,
+                cmd_arg_bufs(&args),
+                build_shell_arg_list(&args, &ret_c)
+            );
+            let cmd = CmdLine {
+                literals: vec![
+                    ("node".to_string(), false),
+                    ("-e".to_string(), false),
+                ],
+                runtime: vec![CmdWord {
+                    expr: "prog".to_string(),
+                    quote: true,
+                }],
+                arglist: !args.is_empty(),
+            };
+            out.push_str(&c_stub_body(
+                &ret_c,
+                &m.sym,
+                &params,
+                &preamble,
+                Some(Program {
+                    prelude: "",
+                    literal: &program,
+                    format: None,
+                    args: "",
+                    suffix: "",
+                    cleanup: "",
+                }),
+                &cmd,
+                marker,
+            ));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// The JavaScript expression that reaches a function of a module.
+///
+/// The name of a function may be a path: a function of a namespace is
+/// reached through the namespace, and a static method of a class through
+/// the class. Every step of the path is checked, so that a missing entry
+/// never raises an error.
+fn node_lookup_expr(root: &str, path: &str) -> String {
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut out = String::new();
+    for i in 0..parts.len() {
+        let mut prefix = String::new();
+        for (j, part) in parts.iter().enumerate().take(i + 1) {
+            if j > 0 {
+                prefix.push('.');
+            }
+            prefix.push_str(part);
+        }
+        if i > 0 {
+            out.push_str(" && ");
+        } else {
+            out.push_str(&format!("{} && ", root));
+        }
+        out.push_str(&format!("{}.{}", root, prefix));
+    }
+    out
+}
