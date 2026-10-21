@@ -303,7 +303,7 @@ fn parse_methods_with_pos(lang: &str, source: &str) -> Vec<(usize, MethodSig)> {
         "cs" => parse_cs_methods(source),
         "py" => parse_python_methods(source),
         "lua" => parse_lua_methods(source),
-        "ts" | "tsx" | "jsx" | "js" => parse_ts_methods(source),
+        "ts" | "tsx" | "jsx" | "js" => parse_ts_methods(lang, source),
         _ => vec![],
     };
     // Attach the enclosing class to every method.
@@ -409,7 +409,7 @@ fn parse_methods_with_pos(lang: &str, source: &str) -> Vec<(usize, MethodSig)> {
             }
             // A class that the module does not publish is not part of the
             // surface of the module, and a method of it cannot be reached.
-            "ts" | "tsx" | "jsx" | "js" => {
+            "ts" | "tsx" => {
                 if let Some(hidden) = chain.iter().find(|d| !d.exported) {
                     m.not_exposed = Some(format!(
                         "the class \"{}\" is not exported, so the method \"{}\" cannot be reached from C",
@@ -1391,7 +1391,7 @@ fn lua_annotations(source: &str, def_pos: usize) -> (Vec<(String, String)>, Opti
 /// A function is declared as "function <name>(...)", as
 /// "const <name> = function (...)", as "const <name> = (...) => ..." or as
 /// a static method of a class, "static <name>(...)".
-fn parse_ts_methods(source: &str) -> Vec<(usize, MethodSig)> {
+fn parse_ts_methods(lang: &str, source: &str) -> Vec<(usize, MethodSig)> {
     // A type is a name, an optional list of generic arguments, an optional
     // array suffix or a tuple. A union of those is a type as well.
     const TYPE: &str = r"(?:[\w.]+(?:\s*<[^<>]*>)?|\[[^\]]*\])(?:\[\])*(?:\s*\|\s*(?:[\w.]+(?:\s*<[^<>]*>)?|\[[^\]]*\])(?:\[\])*)*";
@@ -1400,6 +1400,10 @@ fn parse_ts_methods(source: &str) -> Vec<(usize, MethodSig)> {
         TYPE
     ))
     .unwrap();
+    // Only TypeScript publishes its functions with the "export" keyword.
+    // JavaScript publishes them with "module.exports", and a function of a
+    // file may be published that way.
+    let published = uses_export_keyword(lang);
     // A default export is published under the name "default", whatever the
     // function itself is called, so the export has to be recognised.
     let default_re = Regex::new(r"(?m)\bexport\s+default\s+(?:async\s+)?function\s+(\w+)").unwrap();
@@ -1435,7 +1439,7 @@ fn parse_ts_methods(source: &str) -> Vec<(usize, MethodSig)> {
         };
         // A function that the module does not publish is not part of the
         // surface of the module, and it cannot be reached from C.
-        let not_exposed = if exported {
+        let not_exposed = if exported || !published {
             None
         } else {
             Some(format!(
@@ -1480,7 +1484,7 @@ fn parse_ts_methods(source: &str) -> Vec<(usize, MethodSig)> {
             .unwrap_or_default();
         // A constant that the module does not publish is not part of the
         // surface of the module, and it cannot be reached from C.
-        let not_exposed = if exported {
+        let not_exposed = if exported || !published {
             None
         } else {
             Some(format!(
@@ -1543,6 +1547,16 @@ fn is_default_export(default_re: &Regex, name: &str, source: &str) -> bool {
     default_re
         .captures_iter(source)
         .any(|c| c.get(1).map(|m| m.as_str() == name).unwrap_or(false))
+}
+
+/// Whether the language publishes the functions of a module with the
+/// "export" keyword.
+///
+/// TypeScript does, and a function that is not published is not part of the
+/// surface of the module. JavaScript publishes its functions with
+/// "module.exports", and any function of a file may be published that way.
+fn uses_export_keyword(lang: &str) -> bool {
+    matches!(lang, "ts" | "tsx")
 }
 
 /// Split a parameter list on the commas that are not nested in <>, [] or ().
