@@ -285,8 +285,10 @@ struct ClassDecl {
     indent: usize,
     /// The kind of the declaration: "class", "interface", "namespace", ...
     kind: String,
-    /// The declaration is published by its module: "export class C".
-    exported: bool,
+    /// The name the module publishes the declaration under: "export class C"
+    /// publishes it as "C" and "export default class C" as "default". None
+    /// when the module does not publish it at all.
+    published: Option<String>,
     /// The type parameters the declaration names: "class Gen<T>" names one.
     type_params: Vec<String>,
     /// The classes the declaration inherits from: "class J(Base)".
@@ -296,6 +298,9 @@ struct ClassDecl {
 /// Parse the methods of a source file, keeping the offset of each method so
 /// that the enclosing class can be determined.
 fn parse_methods_with_pos(lang: &str, source: &str) -> Vec<(usize, MethodSig)> {
+    // The names the module publishes. A class or a function that the
+    // module does not publish is not part of the surface of the module.
+    let exports = module_exports(source);
     let mut methods = match lang {
         "java" => parse_java_methods(source),
         "kt" => parse_kotlin_methods(source),
@@ -303,11 +308,22 @@ fn parse_methods_with_pos(lang: &str, source: &str) -> Vec<(usize, MethodSig)> {
         "cs" => parse_cs_methods(source),
         "py" => parse_python_methods(source),
         "lua" => parse_lua_methods(source),
-        "ts" | "tsx" | "jsx" | "js" => parse_ts_methods(lang, source),
+        "ts" | "tsx" | "jsx" | "js" => parse_ts_methods(lang, source, &exports),
         _ => vec![],
     };
     // Attach the enclosing class to every method.
-    let decls = class_declarations(source, lang);
+    let mut decls = class_declarations(source, lang);
+    // A class that the module publishes with an export list or with the
+    // CommonJS form is published under the name of that entry.
+    if matches!(lang, "ts" | "tsx" | "jsx" | "js") {
+        for d in decls.iter_mut() {
+            if d.published.is_none() {
+                if let Some(published) = exports.published_name(&d.name) {
+                    d.published = Some(published.to_string());
+                }
+            }
+        }
+    }
     let package = package_name(source, lang);
     // The constructors of the classes of a Python source. A method of a
     // class needs an instance, and an instance needs a constructor.
@@ -316,11 +332,11 @@ fn parse_methods_with_pos(lang: &str, source: &str) -> Vec<(usize, MethodSig)> {
     } else {
         Vec::new()
     };
-    // The bodies of the functions of a Python source. A class that is
-    // declared inside a function is local to that function, and its
-    // methods cannot be reached from outside it.
-    let py_blocks = if lang == "py" {
-        python_def_blocks(source)
+    // The scopes of a Python source. A class that is declared inside a
+    // function is local to that function, and its methods cannot be
+    // reached from outside it.
+    let py_scopes = if lang == "py" {
+        python_scopes(source)
     } else {
         Vec::new()
     };
@@ -350,11 +366,32 @@ fn parse_methods_with_pos(lang: &str, source: &str) -> Vec<(usize, MethodSig)> {
             // the compiler makes of it is the chain of the names.
             "java" | "kt" | "scala" => join_names(&chain, "$"),
             // Python knows a class inside a class as well, and the class is
-            // reached by its dotted path.
-            "py" => join_names(&chain, "."),
+            // reached by its dotted path. The scopes tell which class the
+            // method belongs to.
+            "py" => py_chain_at(&py_scopes, *pos),
             // A function of a namespace is reached through the namespace,
-            // and a static method of a class through the class.
-            "ts" | "tsx" | "jsx" | "js" => join_names(&chain, "."),
+            // and a static method of a class through the class. The names
+            // are the names the module publishes them under, and a class
+            // the module does not publish is not part of the surface of the
+            // module at all.
+            "ts" | "tsx" | "jsx" | "js" => {
+                let mut names: Vec<String> = Vec::new();
+                let mut published = true;
+                for d in &chain {
+                    match &d.published {
+                        Some(name) => names.push(name.clone()),
+                        None => {
+                            published = false;
+                            break;
+                        }
+                    }
+                }
+                if published && !names.is_empty() {
+                    Some(names.join("."))
+                } else {
+                    None
+                }
+            }
             _ => decls
                 .iter()
                 .rev()
@@ -398,8 +435,10 @@ fn parse_methods_with_pos(lang: &str, source: &str) -> Vec<(usize, MethodSig)> {
             // A class that is declared inside a function is local to that
             // function: its name means nothing outside it.
             "py" => {
-                if let Some(class) = chain.last() {
-                    if inside_a_function(&py_blocks, class.pos) {
+                // A class that is declared inside a function is local to
+                // that function: its name means nothing outside it.
+                if let Some(class) = py_class_at(&py_scopes, *pos) {
+                    if class.in_function {
                         m.not_exposed = Some(format!(
                             "the class \"{}\" is declared inside a function, so the method \"{}\" cannot be reached from C",
                             class.name, m.name
@@ -409,12 +448,34 @@ fn parse_methods_with_pos(lang: &str, source: &str) -> Vec<(usize, MethodSig)> {
             }
             // A class that the module does not publish is not part of the
             // surface of the module, and a method of it cannot be reached.
-            "ts" | "tsx" => {
-                if let Some(hidden) = chain.iter().find(|d| !d.exported) {
-                    m.not_exposed = Some(format!(
-                        "the class \"{}\" is not exported, so the method \"{}\" cannot be reached from C",
-                        hidden.name, m.name
-                    ));
+            // The module may publish the method itself, though: "module
+            // .exports = { calc: Holder.jm }".
+            "ts" | "tsx" | "jsx" | "js" => {
+                if chain.is_empty() {
+                    // A function of the file. The module may publish it
+                    // under a name of its own.
+                    if let Some(published) = exports.published_name(&m.name) {
+                        m.call_expr = published.to_string();
+                    }
+                } else if let Some(hidden) = chain.iter().find(|d| d.published.is_none()) {
+                    let expr =
+                        format!("{}.{}", join_names(&chain, ".").unwrap_or_default(), m.name);
+                    match exports.published_name(&expr) {
+                        Some(published) => {
+                            // The module publishes the method on its own,
+                            // so it is reached through that name.
+                            m.call_expr = published.to_string();
+                            m.qualifier = None;
+                        }
+                        None => {
+                            if lang == "ts" || lang == "tsx" {
+                                m.not_exposed = Some(format!(
+                                    "the class \"{}\" is not exported, so the method \"{}\" cannot be reached from C",
+                                    hidden.name, m.name
+                                ));
+                            }
+                        }
+                    }
                 }
             }
             // A member of a class is an instance method, and an instance
@@ -443,6 +504,9 @@ fn parse_methods_with_pos(lang: &str, source: &str) -> Vec<(usize, MethodSig)> {
                                 "the parameter \"{}\" has the type parameter \"{}\" of the class \"{}\", so the method \"{}\" cannot be called from C",
                                 p.name, raw, class.name, m.name
                             ));
+                            // The first parameter that names the type
+                            // parameter is the one that is reported.
+                            break;
                         }
                     }
                 }
@@ -452,12 +516,15 @@ fn parse_methods_with_pos(lang: &str, source: &str) -> Vec<(usize, MethodSig)> {
         // A method of a Python class needs an instance, and the instance
         // needs a constructor that can be called without arguments.
         if lang == "py" && m.needs_receiver {
-            if let Some(q) = m.qualifier.clone() {
-                if let Some((_, needed)) = py_constructors.iter().find(|(c, _)| *c == q) {
+            if let Some(class) = py_class_at(&py_scopes, *pos) {
+                let constructor = py_constructors.iter().find(|(p, _, _)| *p == class.pos);
+                if let Some((_, _, needed)) = constructor {
                     if *needed > 0 {
                         m.not_callable = Some(format!(
                             "the constructor of the class \"{}\" needs {} argument(s), so the method \"{}\" cannot be called from C",
-                            q, needed, m.name
+                            class.chain.join("."),
+                            needed,
+                            m.name
                         ));
                     }
                 }
@@ -483,43 +550,275 @@ fn join_names(chain: &[&ClassDecl], joiner: &str) -> Option<String> {
     }
 }
 
-/// The bodies of the functions of a Python source: the offset of the name
-/// of the function, the indentation of its definition and the offset of
-/// the end of its body.
-fn python_def_blocks(source: &str) -> Vec<(usize, usize, usize)> {
-    let re = Regex::new(r"(?m)^[ \t]*(?:async[ \t]+)?def[ \t]+(\w+)").unwrap();
-    let mut out = Vec::new();
-    for caps in re.captures_iter(source) {
-        let name_pos = caps.get(1).unwrap().start();
-        let indent = line_indent(source, name_pos);
-        // The body of the function ends at the first line that is not
-        // deeper than the definition itself.
-        let mut offset = caps.get(0).unwrap().end();
-        let rest = &source[offset..];
-        offset += rest.find('\n').map(|i| i + 1).unwrap_or(rest.len());
-        let mut end = source.len();
-        for line in source[offset..].lines() {
-            let start = offset;
-            offset += line.len() + 1;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let depth = line.chars().take_while(|c| *c == ' ' || *c == '\t').count();
-            if depth <= indent {
-                end = start;
-                break;
-            }
-        }
-        out.push((name_pos, indent, end));
-    }
-    out
+/// The kind of a Python statement that opens a scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PyScopeKind {
+    /// A function: "def f():".
+    Function,
+    /// A class: "class C:".
+    Class,
+    /// A block: "if x:", "for x in y:", "with x:".
+    Block,
 }
 
-/// Whether the position is inside the body of a function.
-fn inside_a_function(blocks: &[(usize, usize, usize)], pos: usize) -> bool {
-    blocks
+/// A scope of a Python source: the body of a compound statement.
+#[derive(Debug, Clone)]
+struct PyScope {
+    /// The offset of the header of the statement.
+    pos: usize,
+    /// The indentation of the header.
+    indent: usize,
+    /// The kind of the statement.
+    kind: PyScopeKind,
+    /// The name the statement declares, for a class.
+    name: String,
+    /// The chain of the names of the classes the body of the statement is
+    /// in.
+    chain: Vec<String>,
+    /// Whether the body of the statement is inside a function.
+    in_function: bool,
+    /// The indentation of the body, known once the body starts. The body
+    /// of a statement is the block that follows it, and a statement that
+    /// stands no deeper than that block ends it.
+    body_indent: Option<usize>,
+    /// The offset of the end of the body.
+    end: usize,
+}
+/// The scopes of a Python source.
+///
+/// A Python file is a nest of blocks: the body of a function, the body of a
+/// class and the body of a statement that takes a block. The scopes tell
+/// which class a method belongs to. A class that is declared inside a block
+/// belongs to the scope the block is in, and not to the class above it: a
+/// class that is declared in an "if" at the top level of a file is a class
+/// of the module, even when a class stands above it.
+fn python_scopes(source: &str) -> Vec<PyScope> {
+    let masked = mask_python_code(source);
+    let mut scopes: Vec<PyScope> = Vec::new();
+    // The scopes that are open, the innermost one last.
+    let mut open: Vec<usize> = Vec::new();
+    // The depth of the brackets that are open: a line that is inside
+    // brackets is the continuation of the statement above it.
+    let mut depth = 0i32;
+    let mut offset = 0usize;
+    for line in masked.split_inclusive('\n') {
+        let line_start = offset;
+        offset += line.len();
+        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+        let continuation = depth > 0;
+        for c in trimmed.chars() {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if continuation {
+            // The line is part of the statement above it.
+            continue;
+        }
+        if trimmed.trim().is_empty() {
+            continue;
+        }
+        let indent = trimmed
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .count();
+        // The scopes this line closes: a statement that stands no deeper
+        // than the body of a scope ends that body.
+        loop {
+            let Some(&top) = open.last() else {
+                break;
+            };
+            match scopes[top].body_indent {
+                Some(body) => {
+                    if indent < body {
+                        scopes[top].end = line_start;
+                        open.pop();
+                    } else {
+                        break;
+                    }
+                }
+                None => {
+                    if indent > scopes[top].indent {
+                        // The body of the scope starts here.
+                        scopes[top].body_indent = Some(indent);
+                        break;
+                    }
+                    // The scope has no body of its own: the statement that
+                    // follows it stands at its level.
+                    scopes[top].end = line_start;
+                    open.pop();
+                }
+            }
+        }
+        let Some((kind, name)) = python_header(trimmed) else {
+            continue;
+        };
+        let parent = open.last().map(|&i| &scopes[i]);
+        let parent_chain = parent.map(|s| s.chain.clone()).unwrap_or_default();
+        let in_function = match parent {
+            Some(s) => s.kind == PyScopeKind::Function || s.in_function,
+            None => false,
+        };
+        // A class belongs to the scope it is declared in, and a function
+        // does not open a class of its own.
+        let chain = match kind {
+            PyScopeKind::Class => {
+                let mut chain = parent_chain;
+                chain.push(name.clone());
+                chain
+            }
+            _ => parent_chain,
+        };
+        scopes.push(PyScope {
+            pos: line_start,
+            indent,
+            kind,
+            name,
+            chain,
+            in_function,
+            body_indent: None,
+            end: source.len(),
+        });
+        open.push(scopes.len() - 1);
+    }
+    scopes
+}
+
+/// The kind of a compound statement and the name it declares.
+fn python_header(line: &str) -> Option<(PyScopeKind, String)> {
+    let trimmed = line.trim_start();
+    let rest = trimmed
+        .strip_prefix("async ")
+        .unwrap_or(trimmed)
+        .trim_start();
+    let name = |rest: &str| -> String {
+        rest.chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect()
+    };
+    if let Some(rest) = rest.strip_prefix("def ") {
+        return Some((PyScopeKind::Function, name(rest)));
+    }
+    if let Some(rest) = rest.strip_prefix("class ") {
+        return Some((PyScopeKind::Class, name(rest)));
+    }
+    const BLOCKS: &[&str] = &[
+        "if ", "elif ", "else", "for ", "while ", "with ", "try", "except", "finally", "match",
+        "case ",
+    ];
+    for keyword in BLOCKS {
+        if rest.starts_with(keyword) {
+            return Some((PyScopeKind::Block, String::new()));
+        }
+    }
+    None
+}
+
+/// The scope that holds the given position: the innermost one.
+fn py_scope_at<'a>(scopes: &'a [PyScope], pos: usize) -> Option<&'a PyScope> {
+    scopes
         .iter()
-        .any(|(start, _, end)| *start < pos && pos < *end)
+        .filter(|s| s.pos < pos && pos < s.end)
+        .max_by_key(|s| s.pos)
+}
+
+/// The class that holds the given position, if any.
+fn py_class_at<'a>(scopes: &'a [PyScope], pos: usize) -> Option<&'a PyScope> {
+    scopes
+        .iter()
+        .filter(|s| s.kind == PyScopeKind::Class && s.pos < pos && pos < s.end)
+        .max_by_key(|s| s.pos)
+}
+
+/// The chain of the names of the classes the position is in.
+fn py_chain_at(scopes: &[PyScope], pos: usize) -> Option<String> {
+    let scope = py_scope_at(scopes, pos)?;
+    if scope.chain.is_empty() {
+        None
+    } else {
+        Some(scope.chain.join("."))
+    }
+}
+
+/// The source with the text of the strings and of the comments blanked out.
+///
+/// The blanks keep the length of the source, so that an offset in the
+/// masked source is the offset in the source itself. A definition that is
+/// written in a docstring is then not read as a definition.
+fn mask_python_code(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '#' {
+            // A comment runs to the end of the line.
+            while i < chars.len() && chars[i] != '\n' {
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        if c != '"' && c != '\'' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let quote = c;
+        // A string of three quotes may hold a line break.
+        let triple = i + 2 < chars.len() && chars[i + 1] == quote && chars[i + 2] == quote;
+        let open = if triple { 3 } else { 1 };
+        for _ in 0..open {
+            out.push(quote);
+            i += 1;
+        }
+        loop {
+            if i >= chars.len() {
+                break;
+            }
+            if !triple && chars[i] == '\\' {
+                out.push(' ');
+                i += 1;
+                if i < chars.len() {
+                    if chars[i] == '\n' {
+                        out.push('\n');
+                    } else {
+                        out.push(' ');
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            if triple {
+                if i + 2 < chars.len()
+                    && chars[i] == quote
+                    && chars[i + 1] == quote
+                    && chars[i + 2] == quote
+                {
+                    // The string of three quotes is one statement, so the
+                    // lines it holds are blanked out as well.
+                    for _ in 0..3 {
+                        out.push(' ');
+                    }
+                    i += 3;
+                    break;
+                }
+            } else if chars[i] == quote {
+                out.push(quote);
+                i += 1;
+                break;
+            }
+            if chars[i] == '\n' {
+                out.push('\n');
+            } else {
+                out.push(' ');
+            }
+            i += 1;
+        }
+    }
+    out
 }
 
 /// The indentation of the line the given offset is on.
@@ -529,33 +828,6 @@ fn line_indent(source: &str, pos: usize) -> usize {
         .chars()
         .take_while(|c| *c == ' ' || *c == '\t')
         .count()
-}
-
-/// The chain of the classes that enclose the method at `pos`.
-///
-/// A class may live in another class, and the class the compiler makes of
-/// it then carries the chain of the names. The JVM languages join the names
-/// with a dollar sign, Python with a dot. Only the classes that enclose the
-/// method count, so that a file level function is not read as a method of
-/// the class above it.
-fn enclosing_class_chain(
-    decls: &[ClassDecl],
-    pos: usize,
-    indent: usize,
-    joiner: &str,
-) -> Option<String> {
-    let chain = enclosing_class_decls(decls, pos, indent);
-    if chain.is_empty() {
-        None
-    } else {
-        Some(
-            chain
-                .iter()
-                .map(|d| d.name.as_str())
-                .collect::<Vec<_>>()
-                .join(joiner),
-        )
-    }
 }
 
 /// The classes that enclose the method at `pos`.
@@ -582,15 +854,6 @@ fn enclosing_class_decls<'a>(
         chain_indent = d.indent;
     }
     chain
-}
-
-/// The name the class itself is reached by: the chain of the names of the
-/// classes that hold it, and its own name.
-fn class_qualifier(decls: &[ClassDecl], class: &ClassDecl, joiner: &str) -> String {
-    match enclosing_class_chain(decls, class.pos, class.indent, joiner) {
-        Some(parents) => format!("{}{}{}", parents, joiner, class.name),
-        None => class.name.clone(),
-    }
 }
 
 /// The keywords that introduce a class-like declaration, per language.
@@ -643,12 +906,26 @@ fn class_declarations(source: &str, lang: &str) -> Vec<ClassDecl> {
                     None,
                 )
             };
+            // The name the module publishes the declaration under. A
+            // declaration with the "export" modifier is published under its
+            // own name, and a default export under the name "default".
+            let published = if lang == "py" {
+                None
+            } else if modifiers.split_whitespace().any(|w| w == "export") {
+                if modifiers.split_whitespace().any(|w| w == "default") {
+                    Some("default".to_string())
+                } else {
+                    Some(name.clone())
+                }
+            } else {
+                None
+            };
             ClassDecl {
                 pos: c.get(0).unwrap().start(),
                 name,
                 indent: c.get(1).unwrap().as_str().chars().count(),
                 kind,
-                exported: modifiers.split_whitespace().any(|w| w == "export"),
+                published,
                 type_params: split_names(type_params.as_deref()),
                 bases: split_names(bases.as_deref()),
             }
@@ -666,6 +943,87 @@ fn split_names(text: Option<&str>) -> Vec<String> {
             .collect()
     })
     .unwrap_or_default()
+}
+
+/// The names a module publishes, and the expressions they publish.
+///
+/// A module publishes a name with an export list ("export { A, B as C }") or
+/// with the CommonJS form ("module.exports = { a: b }"). The expression is
+/// the name of the thing that is published, so that a class or a function
+/// that is published under another name can be found.
+#[derive(Debug, Clone, Default)]
+pub struct ModuleExports {
+    /// The expression that is published and the name it is published under.
+    entries: Vec<(String, String)>,
+}
+
+impl ModuleExports {
+    /// The name the module publishes the given expression under.
+    pub fn published_name(&self, expr: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|(value, _)| value == expr)
+            .map(|(_, name)| name.as_str())
+    }
+
+    /// Whether the module publishes the given expression at all.
+    pub fn publishes(&self, expr: &str) -> bool {
+        self.published_name(expr).is_some()
+    }
+}
+
+/// The names a module publishes.
+fn module_exports(source: &str) -> ModuleExports {
+    let mut out = ModuleExports::default();
+    // An export list: "export { A, B as C }".
+    let list = Regex::new(r"(?m)\bexport\s*\{([^}]*)\}").unwrap();
+    for caps in list.captures_iter(source) {
+        for entry in caps.get(1).unwrap().as_str().split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            match entry.split_once(" as ") {
+                Some((local, alias)) => {
+                    let local = local.trim();
+                    let alias = alias.trim();
+                    if !local.is_empty() && !alias.is_empty() {
+                        out.entries.push((local.to_string(), alias.to_string()));
+                    }
+                }
+                None => out.entries.push((entry.to_string(), entry.to_string())),
+            }
+        }
+    }
+    // The CommonJS form: "module.exports = { a: b, c }".
+    let commonjs = Regex::new(r"(?m)\bmodule\.exports\s*=\s*\{([^}]*)\}").unwrap();
+    for caps in commonjs.captures_iter(source) {
+        for entry in caps.get(1).unwrap().as_str().split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            match entry.split_once(':') {
+                Some((name, value)) => {
+                    let name = name.trim();
+                    let value = value.trim();
+                    if !name.is_empty() && !value.is_empty() {
+                        out.entries.push((value.to_string(), name.to_string()));
+                    }
+                }
+                None => out.entries.push((entry.to_string(), entry.to_string())),
+            }
+        }
+    }
+    // The CommonJS form for a single name: "exports.a = b".
+    let props = Regex::new(r"(?m)\bexports\.([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)").unwrap();
+    for caps in props.captures_iter(source) {
+        out.entries.push((
+            caps.get(2).unwrap().as_str().to_string(),
+            caps.get(1).unwrap().as_str().to_string(),
+        ));
+    }
+    out
 }
 
 /// The package (Java, Kotlin, Scala) or namespace (C#) a source file declares.
@@ -702,13 +1060,22 @@ fn parse_java_methods(source: &str) -> Vec<(usize, MethodSig)> {
         let needs_instance = !modifiers.split_whitespace().any(|w| w == "static");
         // A generic method erases its type parameters, so the value it
         // returns is an object when it returns one of them. An object has
-        // no C representation.
-        let not_callable = if type_params
+        // no C representation. A generic method whose return type is a
+        // number is fine: the erasure leaves the number alone.
+        let not_callable = if type_params.is_empty() {
+            None
+        } else if type_params
             .iter()
             .any(|t| normalize_type_name(t) == normalize_type_name(&return_type))
         {
             Some(format!(
                 "the method \"{}\" returns the type parameter \"{}\", whose value cannot be handed to C",
+                name,
+                return_type.trim()
+            ))
+        } else if !java_type_is_representable(&return_type) {
+            Some(format!(
+                "the method \"{}\" returns a \"{}\", which has no representation in C",
                 name,
                 return_type.trim()
             ))
@@ -735,6 +1102,33 @@ fn parse_java_methods(source: &str) -> Vec<(usize, MethodSig)> {
         ));
     }
     methods
+}
+
+/// Whether a value of the given Java type can be handed to C.
+///
+/// The bridge hands a number, a boolean or a text to the C caller. Every
+/// other type - a list, a map, an object - has no C representation, and a
+/// method that returns one cannot be called from C.
+fn java_type_is_representable(raw_type: &str) -> bool {
+    let normalized = normalize_type_name(raw_type);
+    // The package of a type says nothing about what it holds, so only the
+    // name of the type counts.
+    let name = normalized.rsplit('.').next().unwrap_or(&normalized);
+    matches!(
+        name,
+        "double"
+            | "float"
+            | "int"
+            | "long"
+            | "short"
+            | "byte"
+            | "boolean"
+            | "char"
+            | "string"
+            | "integer"
+            | "number"
+            | "character"
+    )
 }
 
 /// Parse Kotlin method signatures: `fun <name>(<params>): <rtype>`
@@ -921,8 +1315,12 @@ fn parse_python_methods(source: &str) -> Vec<(usize, MethodSig)> {
         r"(?m)^[ \t]*(async[ \t]+)?def[ \t]+(\w+)[ \t]*\(([^)]*)\)[ \t]*(?:->[ \t]*([\w\[\]\., |]+))?[ \t]*:",
     )
     .unwrap();
+    // The text of the strings and of the comments is blanked out, so that a
+    // definition that is written in a docstring is not read as a
+    // definition.
+    let masked = mask_python_code(source);
     let mut methods = Vec::new();
-    for caps in re.captures_iter(source) {
+    for caps in re.captures_iter(&masked) {
         let is_async = caps.get(1).is_some();
         let name = caps.get(2).unwrap().as_str().to_string();
         // A dunder is the machinery of the language itself: a constructor, a
@@ -984,7 +1382,7 @@ fn parse_python_methods(source: &str) -> Vec<(usize, MethodSig)> {
             .unwrap_or_default();
         // A function that yields is a generator: it hands its value out one
         // by one instead of returning it.
-        let generator = python_body_yields(source, caps.get(2).unwrap().start());
+        let generator = python_body_yields(&masked, caps.get(2).unwrap().start());
         methods.push((
             caps.get(2).unwrap().start(),
             MethodSig {
@@ -1041,25 +1439,29 @@ fn python_body_yields(source: &str, pos: usize) -> bool {
     false
 }
 
-/// The constructors of the classes a Python source declares: the chain of
-/// the names of the class and the number of arguments its constructor
-/// needs, the receiver aside.
+/// The constructors of the classes a Python source declares: where the
+/// class is declared, the chain of the names of the class and the number of
+/// arguments its constructor needs, the receiver aside.
 ///
 /// A class that declares no constructor of its own uses the one of the
 /// class it inherits from, so the arguments of that one are the arguments
 /// the class needs as well.
-fn python_constructors(source: &str) -> Vec<(String, usize)> {
+fn python_constructors(source: &str) -> Vec<(usize, String, usize)> {
+    let scopes = python_scopes(source);
     let decls = class_declarations(source, "py");
     let re =
         Regex::new(r"(?m)^[ \t]*(?:async[ \t]+)?def[ \t]+(__init__)[ \t]*\(([^)]*)\)").unwrap();
-    // The constructor every class declares itself.
-    let mut own: HashMap<String, usize> = HashMap::new();
-    for caps in re.captures_iter(source) {
+    // The constructor every class declares itself. The classes are told
+    // apart by where they are declared, so that two classes of the same
+    // name do not collide.
+    let mut own: HashMap<usize, usize> = HashMap::new();
+    for caps in re.captures_iter(&mask_python_code(source)) {
         // The offset of the name, not of the line: the line offset includes
         // the indentation, which is what has to be compared.
         let pos = caps.get(1).unwrap().start();
-        let indent = line_indent(source, pos);
-        let chain = enclosing_class_chain(&decls, pos, indent, ".").unwrap_or_default();
+        let Some(class) = py_class_at(&scopes, pos) else {
+            continue;
+        };
         let params = parse_colon_params(caps.get(2).unwrap().as_str());
         // The receiver is not an argument, a parameter with a default value
         // may be left out, and a parameter that collects the rest of the
@@ -1071,15 +1473,14 @@ fn python_constructors(source: &str) -> Vec<(String, usize)> {
                 p.name != "self" && p.name != "cls" && !p.rest && !p.catch_all && !p.has_default
             })
             .count();
-        own.insert(chain, needed);
+        own.insert(class.pos, needed);
     }
     // The constructor of every class: the one it declares, or the one it
     // inherits.
     let mut out = Vec::new();
-    for class in &decls {
-        let chain = class_qualifier(&decls, class, ".");
-        let needed = inherited_constructor_args(&decls, &own, class, &mut Vec::new());
-        out.push((chain, needed));
+    for class in scopes.iter().filter(|s| s.kind == PyScopeKind::Class) {
+        let needed = inherited_constructor_args(&scopes, &decls, &own, class, &mut Vec::new());
+        out.push((class.pos, class.chain.join("."), needed));
     }
     out
 }
@@ -1089,25 +1490,32 @@ fn python_constructors(source: &str) -> Vec<(String, usize)> {
 /// A class that declares no constructor of its own uses the one of the
 /// class it inherits from.
 fn inherited_constructor_args(
+    scopes: &[PyScope],
     decls: &[ClassDecl],
-    own: &HashMap<String, usize>,
-    class: &ClassDecl,
-    seen: &mut Vec<String>,
+    own: &HashMap<usize, usize>,
+    class: &PyScope,
+    seen: &mut Vec<usize>,
 ) -> usize {
-    let chain = class_qualifier(decls, class, ".");
     // A class that inherits from itself would never stop.
-    if seen.contains(&chain) {
+    if seen.contains(&class.pos) {
         return 0;
     }
-    seen.push(chain.clone());
-    if let Some(&needed) = own.get(&chain) {
+    seen.push(class.pos);
+    if let Some(&needed) = own.get(&class.pos) {
         return needed;
     }
-    for base in &class.bases {
-        // The base class is looked up by its plain name: a class of another
-        // file is not known here.
-        if let Some(base_class) = decls.iter().rev().find(|d| &d.name == base) {
-            return inherited_constructor_args(decls, own, base_class, seen);
+    // The base classes of the class are the ones its declaration names.
+    if let Some(decl) = decls.iter().find(|d| d.pos == class.pos) {
+        for base in &decl.bases {
+            // The base class is looked up by its plain name: a class of
+            // another file is not known here.
+            if let Some(base_class) = scopes
+                .iter()
+                .rev()
+                .find(|s| s.kind == PyScopeKind::Class && &s.name == base)
+            {
+                return inherited_constructor_args(scopes, decls, own, base_class, seen);
+            }
         }
     }
     0
@@ -1391,7 +1799,7 @@ fn lua_annotations(source: &str, def_pos: usize) -> (Vec<(String, String)>, Opti
 /// A function is declared as "function <name>(...)", as
 /// "const <name> = function (...)", as "const <name> = (...) => ..." or as
 /// a static method of a class, "static <name>(...)".
-fn parse_ts_methods(lang: &str, source: &str) -> Vec<(usize, MethodSig)> {
+fn parse_ts_methods(lang: &str, source: &str, exports: &ModuleExports) -> Vec<(usize, MethodSig)> {
     // A type is a name, an optional list of generic arguments, an optional
     // array suffix or a tuple. A union of those is a type as well.
     const TYPE: &str = r"(?:[\w.]+(?:\s*<[^<>]*>)?|\[[^\]]*\])(?:\[\])*(?:\s*\|\s*(?:[\w.]+(?:\s*<[^<>]*>)?|\[[^\]]*\])(?:\[\])*)*";
@@ -1439,7 +1847,7 @@ fn parse_ts_methods(lang: &str, source: &str) -> Vec<(usize, MethodSig)> {
         };
         // A function that the module does not publish is not part of the
         // surface of the module, and it cannot be reached from C.
-        let not_exposed = if exported || !published {
+        let not_exposed = if exported || !published || exports.publishes(&name) {
             None
         } else {
             Some(format!(
@@ -1484,7 +1892,7 @@ fn parse_ts_methods(lang: &str, source: &str) -> Vec<(usize, MethodSig)> {
             .unwrap_or_default();
         // A constant that the module does not publish is not part of the
         // surface of the module, and it cannot be reached from C.
-        let not_exposed = if exported || !published {
+        let not_exposed = if exported || !published || exports.publishes(&name) {
             None
         } else {
             Some(format!(
