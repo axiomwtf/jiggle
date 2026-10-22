@@ -1,5 +1,5 @@
 use crate::error::JglcError;
-use crate::manifest::{Manifest, DependencyEntry, CustomLanguage};
+use crate::manifest::{CustomLanguage, DependencyEntry, Manifest};
 use crate::vfs::Vfs;
 use std::collections::HashMap;
 
@@ -10,7 +10,7 @@ pub fn generate_dependency_files(
     vfs: &mut Vfs,
 ) -> Result<(), JglcError> {
     // Validate dependency declarations
-    for (lang, _entries) in &manifest.dependencies {
+    for lang in manifest.dependencies.keys() {
         if !crate::manifest::language_supports_deps(lang) {
             return Err(JglcError::Compiler(format!(
                 "Language '{}' does not support dependency declarations (no ecosystem file)",
@@ -27,21 +27,26 @@ pub fn generate_dependency_files(
     let mut lang_per_output: HashMap<String, String> = HashMap::new();
     for (lang, entries) in &manifest.dependencies {
         let dep_filename = get_dep_filename(lang, custom_languages)?;
-        let existing = files_by_output.entry(dep_filename.clone()).or_insert_with(Vec::new);
+        let existing = files_by_output.entry(dep_filename.clone()).or_default();
         for entry in entries {
             // Avoid duplicate entries (same name)
-            if !existing.iter().any(|e: &DependencyEntry| e.name == entry.name) {
+            if !existing
+                .iter()
+                .any(|e: &DependencyEntry| e.name == entry.name)
+            {
                 existing.push(entry.clone());
             }
         }
-        lang_per_output.entry(dep_filename).or_insert_with(|| lang.clone());
+        lang_per_output
+            .entry(dep_filename)
+            .or_insert_with(|| lang.clone());
     }
     for (dep_filename, entries) in &files_by_output {
         let lang = lang_per_output.get(dep_filename).unwrap();
         let dep_file_content = generate_dep_file(lang, entries, custom_languages)?;
 
         // Check for collision with existing VFS file
-        if vfs.contains(&dep_filename) {
+        if vfs.contains(dep_filename) {
             return Err(JglcError::DepFileNameCollision(format!(
                 "Generated dependency file '{}' conflicts with an existing VFS file",
                 dep_filename
@@ -64,7 +69,10 @@ pub fn generate_dependency_files(
 }
 
 /// Determine the dependency file name for a language
-pub fn get_dep_filename(lang: &str, custom_languages: &[CustomLanguage]) -> Result<String, JglcError> {
+pub fn get_dep_filename(
+    lang: &str,
+    custom_languages: &[CustomLanguage],
+) -> Result<String, JglcError> {
     match lang {
         "rs" => Ok("Cargo.toml".to_string()),
         "js" | "ts" | "tsx" | "jsx" => Ok("package.json".to_string()),
@@ -129,41 +137,48 @@ fn generate_dep_file(
 
 fn generate_custom_dep_file(entries: &[DependencyEntry], custom: &CustomLanguage) -> String {
     let mut lines = Vec::new();
-    
+
     for entry in entries {
-        let line = custom.dep_template
+        let line = custom
+            .dep_template
             .replace("{name}", &entry.name)
             .replace("{version}", &entry.version);
         lines.push(line);
     }
-    
+
     format!("{}\n", lines.join("\n"))
 }
 
 fn generate_cargo_toml(entries: &[DependencyEntry]) -> Result<String, JglcError> {
     // Generate Cargo.toml with a dummy lib target so cargo build resolves deps
     // The actual source files are compiled separately to .o for unified linking
-    let mut content = String::from("[package]\nname = \"jgl-project\"\nversion = \"0.1.0\"\nedition = \"2024\"\nautobins = false\nautoexamples = false\nautotests = false\nautobenches = false\n\n[lib]\nname = \"jgl_project\"\npath = \"jgl_dummy.rs\"\n\n[dependencies]\n");
+    let mut content = String::from(
+        "[package]\nname = \"jgl-project\"\nversion = \"0.1.0\"\nedition = \"2024\"\nautobins = false\nautoexamples = false\nautotests = false\nautobenches = false\n\n[lib]\nname = \"jgl_project\"\npath = \"jgl_dummy.rs\"\n\n[dependencies]\n",
+    );
 
-    
     for entry in entries {
         if entry.version == "*" {
             content.push_str(&format!("{} = \"*\"\n", entry.name));
-        } else if entry.version.starts_with('^') || entry.version.starts_with('>') || 
-           entry.version.starts_with('<') || entry.version.starts_with('=') ||
-           entry.version.starts_with('~') {
+        } else if entry.version.starts_with('^')
+            || entry.version.starts_with('>')
+            || entry.version.starts_with('<')
+            || entry.version.starts_with('=')
+            || entry.version.starts_with('~')
+        {
             content.push_str(&format!("{} = {}\n", entry.name, entry.version));
         } else {
             content.push_str(&format!("{} = \"{}\"\n", entry.name, entry.version));
         }
     }
-    
+
     Ok(content)
 }
 
 fn generate_package_json(entries: &[DependencyEntry]) -> Result<String, JglcError> {
-    let mut content = String::from("{\n  \"name\": \"jgl-project\",\n  \"version\": \"0.1.0\",\n  \"dependencies\": {\n");
-    
+    let mut content = String::from(
+        "{\n  \"name\": \"jgl-project\",\n  \"version\": \"0.1.0\",\n  \"dependencies\": {\n",
+    );
+
     let mut first = true;
     for entry in entries {
         if !first {
@@ -172,14 +187,14 @@ fn generate_package_json(entries: &[DependencyEntry]) -> Result<String, JglcErro
         first = false;
         content.push_str(&format!("    \"{}\": \"{}\"", entry.name, entry.version));
     }
-    
+
     content.push_str("\n  }\n}\n");
     Ok(content)
 }
 
 fn generate_go_mod(entries: &[DependencyEntry]) -> Result<String, JglcError> {
     let mut content = String::from("module jgl\n\ngo 1.21\n\n");
-    
+
     if !entries.is_empty() {
         content.push_str("require (\n");
         for entry in entries {
@@ -207,18 +222,21 @@ fn generate_go_mod(entries: &[DependencyEntry]) -> Result<String, JglcError> {
         }
         content.push_str(")\n");
     }
-    
+
     Ok(content)
 }
 
 fn generate_requirements_txt(entries: &[DependencyEntry]) -> Result<String, JglcError> {
     let mut content = String::new();
-    
+
     for entry in entries {
         if entry.version == "*" {
             content.push_str(&format!("{}\n", entry.name));
-        } else if entry.version.starts_with('>') || entry.version.starts_with('<') || 
-                  entry.version.starts_with('=') || entry.version.starts_with('!') {
+        } else if entry.version.starts_with('>')
+            || entry.version.starts_with('<')
+            || entry.version.starts_with('=')
+            || entry.version.starts_with('!')
+        {
             // Version specifiers like >=1.0, <2.0, ==1.0, !=1.0
             content.push_str(&format!("{}{}\n", entry.name, entry.version));
         } else if entry.version.starts_with('~') || entry.version.starts_with('^') {
@@ -229,7 +247,7 @@ fn generate_requirements_txt(entries: &[DependencyEntry]) -> Result<String, Jglc
             content.push_str(&format!("{}=={}\n", entry.name, entry.version));
         }
     }
-    
+
     Ok(content)
 }
 
@@ -241,58 +259,61 @@ fn generate_pom_xml(entries: &[DependencyEntry]) -> Result<String, JglcError> {
         <groupId>jgl</groupId>\n\
         <artifactId>jgl-project</artifactId>\n\
         <version>0.1.0</version>\n\
-        <dependencies>\n"
+        <dependencies>\n",
     );
-    
+
     for entry in entries {
         // Java/Kotlin/Scala use group:artifact as the name
         let parts: Vec<&str> = entry.name.splitn(2, ':').collect();
-        let group = parts.get(0).copied().unwrap_or("jgl");
-        let artifact = if parts.len() == 2 { parts[1] } else { entry.name.as_str() };
-        
+        let group = parts.first().copied().unwrap_or("jgl");
+        let artifact = if parts.len() == 2 {
+            parts[1]
+        } else {
+            entry.name.as_str()
+        };
+
         content.push_str(&format!(
             "    <dependency>\n      <groupId>{}</groupId>\n      <artifactId>{}</artifactId>\n      <version>{}</version>\n    </dependency>\n",
             group, artifact, entry.version
         ));
     }
-    
+
     content.push_str("</dependencies>\n</project>\n");
     Ok(content)
 }
 
 fn generate_packages_config(entries: &[DependencyEntry]) -> Result<String, JglcError> {
-    let mut content = String::from(
-        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<packages>\n"
-    );
-    
+    let mut content = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<packages>\n");
+
     for entry in entries {
         content.push_str(&format!(
             "  <package id=\"{}\" version=\"{}\" targetFramework=\"native\" />\n",
             entry.name, entry.version
         ));
     }
-    
+
     content.push_str("</packages>\n");
     Ok(content)
 }
 
 fn generate_gemfile(entries: &[DependencyEntry]) -> Result<String, JglcError> {
-    let mut content = String::from("# frozen_string_literal: true\n\nsource 'https://rubygems.org'\n\n");
-    
+    let mut content =
+        String::from("# frozen_string_literal: true\n\nsource 'https://rubygems.org'\n\n");
+
     for entry in entries {
         if entry.version == "*" {
             content.push_str(&format!("gem '{}'\n", entry.name));
         } else {
-            content.push_str(&format!("gem '{}', {}\n", entry.name, &entry.version));
+            content.push_str(&format!("gem '{}', {}\n", entry.name, entry.version));
         }
     }
-    
+
     Ok(content)
 }
 
 fn generate_composer_json(entries: &[DependencyEntry]) -> Result<String, JglcError> {
     let mut content = String::from("{\n  \"name\": \"jgl/project\",\n  \"require\": {\n");
-    
+
     let mut first = true;
     for entry in entries {
         if !first {
@@ -301,7 +322,7 @@ fn generate_composer_json(entries: &[DependencyEntry]) -> Result<String, JglcErr
         first = false;
         content.push_str(&format!("    \"{}\": \"^{}\"", entry.name, entry.version));
     }
-    
+
     content.push_str("\n  }\n}\n");
     Ok(content)
 }
@@ -313,7 +334,10 @@ fn generate_build_zig_zon(entries: &[DependencyEntry]) -> Result<String, JglcErr
         let url = if entry.version == "*" {
             format!("https://github.com/{}/{}.git", entry.name, entry.name)
         } else {
-            format!("https://github.com/{}/{}/archive/{}.tar.gz", entry.name, entry.name, entry.version)
+            format!(
+                "https://github.com/{}/{}/archive/{}.tar.gz",
+                entry.name, entry.name, entry.version
+            )
         };
         content.push_str(&format!(
             "    \"{}\" = .{{\n        .url = \"{}\",\n        // Run `zig fetch` to generate the correct .hash\n        .hash = \"0000000000000000000000000000000000000000000000000000000000000000\",\n    }},\n",
@@ -327,13 +351,13 @@ fn generate_build_zig_zon(entries: &[DependencyEntry]) -> Result<String, JglcErr
 
 fn generate_nimble(entries: &[DependencyEntry]) -> Result<String, JglcError> {
     let mut content = String::from(
-        "# Package\nversion       = \"0.1.0\"\nauthor        = \"Jiggle\"\ndescription = \"JGL project\"\n\n"
+        "# Package\nversion       = \"0.1.0\"\nauthor        = \"Jiggle\"\ndescription = \"JGL project\"\n\n",
     );
-    
+
     for entry in entries {
         content.push_str(&format!("requires \"{}\"\n", entry.name));
     }
-    
+
     Ok(content)
 }
 
@@ -342,22 +366,22 @@ fn generate_rockspec(entries: &[DependencyEntry]) -> Result<String, JglcError> {
         "rockspec_format = \"3.0\"\n\
         package = \"jgl-project\"\n\
         version = \"0.1.0-1\"\n\n\
-        dependencies = {\n"
+        dependencies = {\n",
     );
-    
+
     for entry in entries {
         content.push_str(&format!("  \"{}\",\n", entry.name));
     }
-    
+
     content.push_str("}\n");
     Ok(content)
 }
 
 fn generate_vcpkg_json(entries: &[DependencyEntry]) -> Result<String, JglcError> {
     let mut content = String::from(
-        "{\n  \"name\": \"jgl-project\",\n  \"version-string\": \"0.1.0\",\n  \"dependencies\": [\n"
+        "{\n  \"name\": \"jgl-project\",\n  \"version-string\": \"0.1.0\",\n  \"dependencies\": [\n",
     );
-    
+
     let mut first = true;
     for entry in entries {
         if !first {
@@ -366,19 +390,18 @@ fn generate_vcpkg_json(entries: &[DependencyEntry]) -> Result<String, JglcError>
         first = false;
         content.push_str(&format!("\"{}\"", entry.name));
     }
-    
+
     content.push_str("\n  ]\n}\n");
     Ok(content)
 }
 
 fn generate_fpm_toml(entries: &[DependencyEntry]) -> Result<String, JglcError> {
-    let mut content = String::from(
-        "[project]\nname = \"jgl-project\"\nversion = \"0.1.0\"\n\n[dependencies]\n"
-    );
-    
+    let mut content =
+        String::from("[project]\nname = \"jgl-project\"\nversion = \"0.1.0\"\n\n[dependencies]\n");
+
     for entry in entries {
         content.push_str(&format!("{} = \"{}\"\n", entry.name, entry.version));
     }
-    
+
     Ok(content)
 }

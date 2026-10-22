@@ -46,9 +46,13 @@ pub fn parse_jgl(content: &str) -> Result<JglFile, JglcError> {
         // Try to read a block header (look for pattern ending with {)
         let header_start = pos;
         let mut header_end = pos;
-        
+
         // Read until we find '{' or end of line
-        while header_end < chars.len() && chars[header_end] != '{' && chars[header_end] != '\n' && chars[header_end] != '\r' {
+        while header_end < chars.len()
+            && chars[header_end] != '{'
+            && chars[header_end] != '\n'
+            && chars[header_end] != '\r'
+        {
             header_end += 1;
         }
 
@@ -85,10 +89,10 @@ pub fn parse_jgl(content: &str) -> Result<JglFile, JglcError> {
 
         // Parse the block body (including nested braces)
         match parse_block_body_balanced(&chars, &mut pos) {
-            Some((body_chars, body_start, body_end)) => {
+            Some((body_chars, _body_start, _body_end)) => {
                 // pos now points after the closing '}'
                 let body: String = body_chars.iter().collect();
-                
+
                 // Parse the header to determine block type
                 let block = parse_header(trimmed_header, body);
                 blocks.push(block);
@@ -118,7 +122,7 @@ pub fn parse_jgl(content: &str) -> Result<JglFile, JglcError> {
                 let lang = &block.language;
                 let count = unnamed_indices.entry(lang.clone()).or_insert(0);
                 *count += 1;
-                
+
                 Block {
                     name: format!("v{}", count),
                     is_named: true,
@@ -211,7 +215,6 @@ fn parse_block_body_balanced(chars: &[char], pos: &mut usize) -> Option<(Vec<cha
     let mut i = *pos;
     let mut str_state: Option<char> = None; // None, Some('"'), Some('`')
 
-
     while i < chars.len() {
         let c = chars[i];
 
@@ -250,9 +253,9 @@ fn parse_block_body_balanced(chars: &[char], pos: &mut usize) -> Option<(Vec<cha
                     return Some((body_chars, body_start, i));
                 }
             }
-            '/' => {
+            '/'
                 // Handle comments (but not regex literals)
-                if i + 1 < chars.len() {
+                if i + 1 < chars.len() => {
                     if chars[i + 1] == '/' {
                         // Line comment - skip to end of line
                         while i < chars.len() && chars[i] != '\n' {
@@ -269,7 +272,6 @@ fn parse_block_body_balanced(chars: &[char], pos: &mut usize) -> Option<(Vec<cha
                         }
                     }
                 }
-            }
             _ => {}
         }
         i += 1;

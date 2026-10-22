@@ -1,5 +1,5 @@
-use crate::parser::Block;
 use crate::error::JglcError;
+use crate::parser::Block;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -98,24 +98,21 @@ impl Manifest {
                 let ext = ext.trim();
                 if !ext.is_empty() {
                     i += 1;
-                    match parse_custom_language(&lines, &mut i, ext) {
-                        Ok(custom_lang) => manifest.custom_languages.push(custom_lang),
-                        Err(e) => return Err(e),
+                    {
+                        let custom_lang = parse_custom_language(&lines, &mut i, ext)?;
+                        manifest.custom_languages.push(custom_lang)
                     }
                     continue;
                 }
             }
 
-
             // Parse dependency block: dep[lang] {
             if line.starts_with("dep[") && line.ends_with('{') {
                 let lang = extract_dep_lang(line)?;
                 i += 1;
-                match parse_dependency_block(&lines, &mut i) {
-                    Ok(entries) => {
-                        manifest.dependencies.insert(lang, entries);
-                    }
-                    Err(e) => return Err(e),
+                {
+                    let entries = parse_dependency_block(&lines, &mut i)?;
+                    manifest.dependencies.insert(lang, entries);
                 }
                 continue;
             }
@@ -124,7 +121,7 @@ impl Manifest {
         }
 
         // Validate custom languages have dep blocks
-        for custom_lang in &manifest.custom_languages {
+        for _custom_lang in &manifest.custom_languages {
             // Custom languages must have a dep.<file> block (which is parsed inside the _sh block)
             // The parser already ensured this, but double check
         }
@@ -137,7 +134,10 @@ fn parse_import(line: &str) -> Result<PathBuf, JglcError> {
     // Format: import "auth.jgl"
     let parts: Vec<&str> = line.splitn(2, ' ').collect();
     if parts.len() != 2 {
-        return Err(JglcError::Import(format!("Invalid import statement: {}", line)));
+        return Err(JglcError::Import(format!(
+            "Invalid import statement: {}",
+            line
+        )));
     }
 
     let import_path = parts[1].trim().trim_matches('"').trim_matches('\'');
@@ -154,7 +154,10 @@ fn parse_target(line: &str) -> Result<Target, JglcError> {
     //         target x86_64-unknown-linux-gnu
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() != 2 {
-        return Err(JglcError::Parse(format!("Invalid target statement: {}", line)));
+        return Err(JglcError::Parse(format!(
+            "Invalid target statement: {}",
+            line
+        )));
     }
 
     Ok(match parts[1] {
@@ -164,7 +167,11 @@ fn parse_target(line: &str) -> Result<Target, JglcError> {
     })
 }
 
-fn parse_custom_language(lines: &[&str], i: &mut usize, ext: &str) -> Result<CustomLanguage, JglcError> {
+fn parse_custom_language(
+    lines: &[&str],
+    i: &mut usize,
+    ext: &str,
+) -> Result<CustomLanguage, JglcError> {
     let mut compile_command = String::new();
     let mut dep_file = String::new();
     let mut dep_template = String::new();
@@ -192,7 +199,11 @@ fn parse_custom_language(lines: &[&str], i: &mut usize, ext: &str) -> Result<Cus
                 dep_file = dep_header[pos + 1..].trim().to_string();
             } else {
                 // The whole thing after "dep" is the filename
-                dep_file = dep_header.trim_start_matches("dep").trim_start_matches('.').trim().to_string();
+                dep_file = dep_header
+                    .trim_start_matches("dep")
+                    .trim_start_matches('.')
+                    .trim()
+                    .to_string();
             }
 
             *i += 1;
@@ -233,7 +244,10 @@ fn parse_custom_language(lines: &[&str], i: &mut usize, ext: &str) -> Result<Cus
     })
 }
 
-fn parse_dependency_block(lines: &[&str], i: &mut usize) -> Result<Vec<DependencyEntry>, JglcError> {
+fn parse_dependency_block(
+    lines: &[&str],
+    i: &mut usize,
+) -> Result<Vec<DependencyEntry>, JglcError> {
     let mut entries = Vec::new();
 
     while *i < lines.len() {
@@ -255,7 +269,10 @@ fn parse_dependency_block(lines: &[&str], i: &mut usize) -> Result<Vec<Dependenc
         if let Some((name, version)) = parse_dependency_entry(line) {
             entries.push(DependencyEntry { name, version });
         } else {
-            return Err(JglcError::Parse(format!("Invalid dependency entry: {}", line)));
+            return Err(JglcError::Parse(format!(
+                "Invalid dependency entry: {}",
+                line
+            )));
         }
 
         *i += 1;
@@ -269,7 +286,10 @@ fn parse_dependency_entry(line: &str) -> Option<(String, String)> {
     let eq_pos = line.find('=')?;
     let name = line[..eq_pos].trim().to_string();
     let version_part = line[eq_pos + 1..].trim();
-    let version = version_part.trim_matches('"').trim_matches('\'').to_string();
+    let version = version_part
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string();
 
     if name.is_empty() {
         return None;
@@ -280,12 +300,19 @@ fn parse_dependency_entry(line: &str) -> Option<(String, String)> {
 
 fn extract_dep_lang(line: &str) -> Result<String, JglcError> {
     // Format: dep[lang] {
-    let start = line.find('[').ok_or_else(|| JglcError::Parse(format!("Invalid dep block: {}", line)))?;
-    let end = line.find(']').ok_or_else(|| JglcError::Parse(format!("Invalid dep block: {}", line)))?;
+    let start = line
+        .find('[')
+        .ok_or_else(|| JglcError::Parse(format!("Invalid dep block: {}", line)))?;
+    let end = line
+        .find(']')
+        .ok_or_else(|| JglcError::Parse(format!("Invalid dep block: {}", line)))?;
     let lang = line[start + 1..end].trim().to_string();
 
     if lang.is_empty() {
-        return Err(JglcError::Parse(format!("Empty language in dep block: {}", line)));
+        return Err(JglcError::Parse(format!(
+            "Empty language in dep block: {}",
+            line
+        )));
     }
 
     Ok(lang)
@@ -336,26 +363,37 @@ fn resolve_imports_inner(
             )));
         }
 
-        let content = std::fs::read_to_string(&import_path)
-            .map_err(|e| JglcError::Import(format!("Failed to read import {}: {}", import_path.display(), e)))?;
+        let content = std::fs::read_to_string(&import_path).map_err(|e| {
+            JglcError::Import(format!(
+                "Failed to read import {}: {}",
+                import_path.display(),
+                e
+            ))
+        })?;
 
         let imported = crate::parser::parse_jgl(&content)?;
 
         if let Some(imported_manifest) = imported.manifest {
             let mut sub_manifest = Manifest::parse(&imported_manifest)?;
             // Depth-first resolution: recursively resolve sub-imports
-            let sub_imports = resolve_imports_inner(&mut sub_manifest, import_path.parent().unwrap_or(base_dir), visited)?;
+            let sub_imports = resolve_imports_inner(
+                &mut sub_manifest,
+                import_path.parent().unwrap_or(base_dir),
+                visited,
+            )?;
             imported_blocks.extend(sub_imports);
 
             // Merge dependencies
             for (lang, deps) in sub_manifest.dependencies {
-                let existing = manifest.dependencies.entry(lang.clone()).or_insert_with(Vec::new);
+                let existing = manifest.dependencies.entry(lang.clone()).or_default();
                 merge_dependencies(existing, &deps)?;
                 // Check if empty after merge (shouldn't happen since we add entries)
             }
 
             // Merge custom languages
-            manifest.custom_languages.extend(sub_manifest.custom_languages);
+            manifest
+                .custom_languages
+                .extend(sub_manifest.custom_languages);
         }
 
         // Collect blocks from this import

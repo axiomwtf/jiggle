@@ -1,13 +1,13 @@
-mod parser;
-mod manifest;
-mod vfs;
-mod deps;
-mod bundler;
 mod build_scripts;
-mod ffi;
-mod compiler;
+mod bundler;
 mod cli;
+mod compiler;
+mod deps;
 mod error;
+mod ffi;
+mod manifest;
+mod parser;
+mod vfs;
 
 use clap::Parser;
 
