@@ -1,0 +1,172 @@
+project._jgl {
+    target native
+    name mixed
+}
+
+main._c {
+    #include <stdio.h>
+    #include <string.h>
+    #include <stdlib.h>
+
+    /* Java: zero params, one param, three params, mixed types, String return */
+    extern double zero();
+    extern double scale(double v);
+    extern double mix(double a, long b, const char *s);
+    extern char *label();
+    extern int is_positive(double v);
+    extern double scaled_int(int n);
+
+    /* C#: two classes in two files, long return, string param */
+    extern long double_it(long v);
+    extern char *greet(const char *who);
+
+    /* Python: two files, class methods, mixed types */
+    extern double rect_area(double w, double h);
+    extern long count_letters(const char *text);
+    extern double triple(double v);
+
+    /* Lua: two files, module table and global function, string param */
+    extern double circle_area(double r);
+    extern char *shout(const char *s);
+
+    /* TypeScript: string return, bool param */
+    extern double sum3(double a, double b, double c);
+    extern char *join(const char *a, const char *b);
+    extern double flag(int flag);
+
+    int main(void) {
+        printf("= %g\n", zero());
+        printf("= %g\n", scale(3.5));
+        printf("= %g\n", mix(2.0, 7, "hi"));
+        printf("= %s\n", label());
+        printf("= %d\n", is_positive(2.5));
+        printf("= %g\n", scaled_int(9));
+
+        printf("= %ld\n", double_it(21));
+        printf("= %s\n", greet("world"));
+
+        printf("= %g\n", rect_area(3.0, 4.0));
+        printf("= %ld\n", count_letters("abcd"));
+        printf("= %g\n", triple(5.0));
+
+        printf("= %g\n", circle_area(2.0));
+        printf("= %s\n", shout("hey"));
+
+        printf("= %g\n", sum3(1.0, 2.0, 3.0));
+        printf("= %s\n", join("a", "b"));
+        printf("= %g\n", flag(1));
+
+        return 0;
+    }
+}
+
+alpha._java {
+    package com.example.demo;
+
+    import java.util.Random;
+
+    public class Alpha {
+        public static double zero() {
+            return 42.0;
+        }
+
+        public static double scale(double v) {
+            return v * 2.0;
+        }
+    }
+}
+
+beta._java {
+    package com.example.demo;
+
+    public class Beta {
+        public static double mix(double a, long b, String s) {
+            return a + b + s.length();
+        }
+
+        public static String label() {
+            return "java-label";
+        }
+
+        public static boolean is_positive(double v) {
+            return v > 0;
+        }
+    }
+}
+
+beta2._java {
+    package com.example.demo;
+
+    public class Beta2 {
+        public static double scaled_int(int n) {
+            return n * 0.5;
+        }
+    }
+}
+
+csutil._cs {
+    using System;
+
+    public class CsUtil {
+        public static long double_it(long v) {
+            return v * 2;
+        }
+    }
+}
+
+csgreet._cs {
+    using System;
+
+    public class CsGreet {
+        public static string greet(string who) {
+            return "hello " + who;
+        }
+    }
+}
+
+mathy._py {
+    import sys
+
+    class Shapes:
+        @staticmethod
+        def rect_area(w: float, h: float) -> float:
+            return w * h
+
+    def triple(v: float) -> float:
+        return v * 3.0
+}
+
+texty._py {
+    def count_letters(text: str) -> int:
+        return len(text)
+}
+
+geo._lua {
+    local function area(r)
+        return 3.14159265358979 * r * r
+    end
+
+    return { circle_area = area }
+}
+
+shout._lua {
+    ---@param s string
+    ---@return string
+    function shout(s)
+        return string.upper(s)
+    end
+}
+
+calc._ts {
+    export function sum3(a: number, b: number, c: number): number {
+        return a + b + c;
+    }
+
+    export function join(a: string, b: string): string {
+        return a + "-" + b;
+    }
+
+    export function flag(f: boolean): number {
+        return f ? 1 : 0;
+    }
+}

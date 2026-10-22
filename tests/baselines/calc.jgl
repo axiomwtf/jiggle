@@ -1,0 +1,243 @@
+project._jgl {
+    target native
+    name calc
+}
+
+main._c {
+    #include <stdio.h>
+    #include <string.h>
+    #include <stdlib.h>
+
+    extern double cpp_sub(double a, double b);
+    extern double go_mul(double a, double b);
+    extern double java_mod(double a, double b);
+    extern double cs_pow(double a, double b);
+    extern double zig_sqrt(double a);
+    extern double rust_pi(void);
+    extern double nim_log(double a);
+    extern double nim_log2(double a, double base);
+    extern double fortran_sin(double a);
+    extern double fortran_cos(double a);
+    extern double fortran_tan(double a);
+    extern double python_abs(double a);
+    extern double lua_floor(double a);
+    extern double lua_ceil(double a);
+    extern double ts_round(double a);
+    double c_add(double a, double b) {
+        return a + b;
+    }
+
+    double c_div(double a, double b) {
+        if (b == 0.0) {
+            fprintf(stderr, "Error: Division by zero\n");
+            return 0.0;
+        }
+        return a / b;
+    }
+
+    int main(void) {
+        char line[256];
+        printf("Jiggle Calculator — q to quit\n");
+        printf("  Binary ops:         <number> <op> <number>\n");
+        printf("    +  C    -  C++    *  Go    /  C\n");
+        printf("    %%  Java  ^  C#\n");
+        printf("  Unary ops:\n");
+        printf("    sqrt <n>          Zig\n");
+        printf("    sin/cos/tan <n>   Fortran\n");
+        printf("    log <n>           Nim (natural log)\n");
+        printf("    log <n> <base>    Nim (log base b)\n");
+        printf("    pi [op n]         Rust\n");
+        printf("    abs <n>          Python\n");
+        printf("    floor <n>        Lua\n");
+        printf("    ceil <n>         Lua\n");
+        printf("    round <n>        TypeScript\n");
+
+        while (1) {
+            printf("> ");
+            fflush(stdout);
+            if (!fgets(line, sizeof(line), stdin)) break;
+            line[strcspn(line, "\n")] = '\0';
+            if (strcmp(line, "q") == 0 || strcmp(line, "quit") == 0) break;
+
+            double x, y;
+
+            /* sqrt */
+            if (sscanf(line, "sqrt %lf", &x) == 1) {
+                if (x < 0.0) { printf("Error: sqrt of negative number\n"); continue; }
+                printf("= %g\n", zig_sqrt(x));
+                continue;
+            }
+
+            /* trig */
+            if (sscanf(line, "sin %lf", &x) == 1) { printf("= %g\n", fortran_sin(x)); continue; }
+            if (sscanf(line, "cos %lf", &x) == 1) { printf("= %g\n", fortran_cos(x)); continue; }
+            if (sscanf(line, "tan %lf", &x) == 1) { printf("= %g\n", fortran_tan(x)); continue; }
+
+            /* scripting language ops */
+            if (sscanf(line, "abs %lf", &x) == 1) { printf("= %g\n", python_abs(x)); continue; }
+            if (sscanf(line, "floor %lf", &x) == 1) { printf("= %g\n", lua_floor(x)); continue; }
+            if (sscanf(line, "ceil %lf", &x) == 1) { printf("= %g\n", lua_ceil(x)); continue; }
+            if (sscanf(line, "round %lf", &x) == 1) { printf("= %g\n", ts_round(x)); continue; }
+
+            /* log */
+            if (sscanf(line, "log %lf %lf", &x, &y) == 2) { printf("= %g\n", nim_log2(x, y)); continue; }
+            if (sscanf(line, "log %lf", &x) == 1) { printf("= %g\n", nim_log(x)); continue; }
+
+            /* pi [op number] */
+            char pi_op[4];
+            double pi_b;
+            if (strncmp(line, "pi", 2) == 0) {
+                double pi = rust_pi();
+                if (sscanf(line, "pi %3s %lf", pi_op, &pi_b) == 2) {
+                    double result;
+                    if      (strcmp(pi_op, "+") == 0) result = c_add(pi, pi_b);
+                    else if (strcmp(pi_op, "-") == 0) result = cpp_sub(pi, pi_b);
+                    else if (strcmp(pi_op, "*") == 0) result = go_mul(pi, pi_b);
+                    else if (strcmp(pi_op, "/") == 0) result = c_div(pi, pi_b);
+                    else if (strcmp(pi_op, "%") == 0) result = java_mod(pi, pi_b);
+                    else if (strcmp(pi_op, "^") == 0) result = cs_pow(pi, pi_b);
+                    else { printf("Error: unknown operator %s\n", pi_op); continue; }
+                    printf("= %g\n", result);
+                } else {
+                    printf("= %g\n", pi);
+                }
+                continue;
+            }
+
+            /* binary op */
+            char op[4];
+            double a, b;
+            if (sscanf(line, "%lf %3s %lf", &a, op, &b) != 3) {
+                printf("Error: unrecognised input\n");
+                continue;
+            }
+
+            double result;
+            if      (strcmp(op, "+") == 0) result = c_add(a, b);
+            else if (strcmp(op, "-") == 0) result = cpp_sub(a, b);
+            else if (strcmp(op, "*") == 0) result = go_mul(a, b);
+            else if (strcmp(op, "/") == 0) result = c_div(a, b);
+            else if (strcmp(op, "%") == 0) result = java_mod(a, b);
+            else if (strcmp(op, "^") == 0) result = cs_pow(a, b);
+            else { printf("Error: unknown operator %s\n", op); continue; }
+
+            printf("= %g\n", result);
+        }
+        return 0;
+    }
+}
+
+ops._cpp {
+    extern "C" double cpp_sub(double a, double b) {
+        return a - b;
+    }
+}
+
+ops._go {
+    package main
+
+    import "C"
+
+    //export go_mul
+    func go_mul(a C.double, b C.double) C.double {
+        return C.double(float64(a) * float64(b))
+    }
+
+    func main() {}
+}
+
+ops._java {
+    public class ops {
+        public static double java_mod(double a, double b) {
+            return a % b;
+        }
+    }
+}
+
+ops._cs {
+    using System;
+
+    public class Ops {
+        public static double cs_pow(double a, double b) {
+            return Math.Pow(a, b);
+        }
+    }
+}
+
+ops._zig {
+    const std = @import("std");
+
+    export fn zig_sqrt(a: f64) f64 {
+        return std.math.sqrt(a);
+    }
+}
+
+ops._rs {
+    use std::f64::consts::PI;
+
+    #[no_mangle]
+    pub extern "C" fn rust_pi() -> f64 {
+        PI
+    }
+}
+
+ops._nim {
+    import math
+
+    proc nim_log(a: float64): float64 {.exportc.} =
+        ln(a)
+
+    proc nim_log2(a: float64, base: float64): float64 {.exportc.} =
+        ln(a) / ln(base)
+}
+
+ops._f90 {
+    function fortran_sin(a) result(r) bind(C, name="fortran_sin")
+        use iso_c_binding
+        implicit none
+        real(c_double), value :: a
+        real(c_double) :: r
+        r = sin(a)
+    end function
+
+    function fortran_cos(a) result(r) bind(C, name="fortran_cos")
+        use iso_c_binding
+        implicit none
+        real(c_double), value :: a
+        real(c_double) :: r
+        r = cos(a)
+    end function
+
+    function fortran_tan(a) result(r) bind(C, name="fortran_tan")
+        use iso_c_binding
+        implicit none
+        real(c_double), value :: a
+        real(c_double) :: r
+        r = tan(a)
+    end function
+}
+
+ops._py {
+    import sys
+
+    def python_abs(a):
+        return abs(a)
+}
+
+ops._lua {
+    local math = require("math")
+
+    function lua_floor(a)
+        return math.floor(a)
+    end
+
+    function lua_ceil(a)
+        return math.ceil(a)
+    end
+}
+
+ops._ts {
+    export function ts_round(a: number): number {
+        return Math.round(a);
+    }
+}
