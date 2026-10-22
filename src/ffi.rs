@@ -5,6 +5,7 @@
 // methods per file, any number of files per language, any parameter count, any
 // mix of parameter types and any return type.
 
+use crate::vfs::{mask_c_style_code, mask_python_code};
 use regex::Regex;
 use std::collections::HashMap;
 
@@ -131,8 +132,10 @@ impl JglType {
             }
             _ => {
                 // Anything array shaped is a collection, everything else is an
-                // opaque object.
-                if t.ends_with("[]") {
+                // opaque object. A collection that names its elements in
+                // square brackets ("list[int]", "seq[string]") is a
+                // collection as well.
+                if t.ends_with("[]") || is_bracket_collection(&t) {
                     JglType::Array
                 } else {
                     JglType::Object
@@ -140,6 +143,30 @@ impl JglType {
             }
         }
     }
+}
+
+/// Whether the type names a collection whose elements are written in
+/// square brackets: "list[int]", "seq[string]", "set[double]".
+fn is_bracket_collection(type_name: &str) -> bool {
+    for name in [
+        "list",
+        "array",
+        "seq",
+        "vector",
+        "slice",
+        "tuple",
+        "set",
+        "frozenset",
+        "collection",
+    ] {
+        if let Some(rest) = type_name.strip_prefix(name)
+            && rest.starts_with('[')
+            && rest.ends_with(']')
+        {
+            return true;
+        }
+    }
+    false
 }
 
 impl Param {
@@ -317,10 +344,10 @@ fn parse_methods_with_pos(lang: &str, source: &str) -> Vec<(usize, MethodSig)> {
     // CommonJS form is published under the name of that entry.
     if matches!(lang, "ts" | "tsx" | "jsx" | "js") {
         for d in decls.iter_mut() {
-            if d.published.is_none() {
-                if let Some(published) = exports.published_name(&d.name) {
-                    d.published = Some(published.to_string());
-                }
+            if d.published.is_none()
+                && let Some(published) = exports.published_name(&d.name)
+            {
+                d.published = Some(published.to_string());
             }
         }
     }
@@ -437,13 +464,13 @@ fn parse_methods_with_pos(lang: &str, source: &str) -> Vec<(usize, MethodSig)> {
             "py" => {
                 // A class that is declared inside a function is local to
                 // that function: its name means nothing outside it.
-                if let Some(class) = py_class_at(&py_scopes, *pos) {
-                    if class.in_function {
-                        m.not_exposed = Some(format!(
-                            "the class \"{}\" is declared inside a function, so the method \"{}\" cannot be reached from C",
-                            class.name, m.name
-                        ));
-                    }
+                if let Some(class) = py_class_at(&py_scopes, *pos)
+                    && class.in_function
+                {
+                    m.not_exposed = Some(format!(
+                        "the class \"{}\" is declared inside a function, so the method \"{}\" cannot be reached from C",
+                        class.name, m.name
+                    ));
                 }
             }
             // A class that the module does not publish is not part of the
@@ -468,7 +495,7 @@ fn parse_methods_with_pos(lang: &str, source: &str) -> Vec<(usize, MethodSig)> {
                             m.qualifier = None;
                         }
                         None => {
-                            if lang == "ts" || lang == "tsx" {
+                            if lang == "ts" || lang == "tsx" || lang == "js" || lang == "jsx" {
                                 m.not_exposed = Some(format!(
                                     "the class \"{}\" is not exported, so the method \"{}\" cannot be reached from C",
                                     hidden.name, m.name
@@ -515,19 +542,20 @@ fn parse_methods_with_pos(lang: &str, source: &str) -> Vec<(usize, MethodSig)> {
         }
         // A method of a Python class needs an instance, and the instance
         // needs a constructor that can be called without arguments.
-        if lang == "py" && m.needs_receiver {
-            if let Some(class) = py_class_at(&py_scopes, *pos) {
-                let constructor = py_constructors.iter().find(|(p, _, _)| *p == class.pos);
-                if let Some((_, _, needed)) = constructor {
-                    if *needed > 0 {
-                        m.not_callable = Some(format!(
-                            "the constructor of the class \"{}\" needs {} argument(s), so the method \"{}\" cannot be called from C",
-                            class.chain.join("."),
-                            needed,
-                            m.name
-                        ));
-                    }
-                }
+        if lang == "py"
+            && m.needs_receiver
+            && let Some(class) = py_class_at(&py_scopes, *pos)
+        {
+            let constructor = py_constructors.iter().find(|(p, _, _)| *p == class.pos);
+            if let Some((_, _, needed)) = constructor
+                && *needed > 0
+            {
+                m.not_callable = Some(format!(
+                    "the constructor of the class \"{}\" needs {} argument(s), so the method \"{}\" cannot be called from C",
+                    class.chain.join("."),
+                    needed,
+                    m.name
+                ));
             }
         }
     }
@@ -717,7 +745,7 @@ fn python_header(line: &str) -> Option<(PyScopeKind, String)> {
 }
 
 /// The scope that holds the given position: the innermost one.
-fn py_scope_at<'a>(scopes: &'a [PyScope], pos: usize) -> Option<&'a PyScope> {
+fn py_scope_at(scopes: &[PyScope], pos: usize) -> Option<&PyScope> {
     scopes
         .iter()
         .filter(|s| s.pos < pos && pos < s.end)
@@ -725,7 +753,7 @@ fn py_scope_at<'a>(scopes: &'a [PyScope], pos: usize) -> Option<&'a PyScope> {
 }
 
 /// The class that holds the given position, if any.
-fn py_class_at<'a>(scopes: &'a [PyScope], pos: usize) -> Option<&'a PyScope> {
+fn py_class_at(scopes: &[PyScope], pos: usize) -> Option<&PyScope> {
     scopes
         .iter()
         .filter(|s| s.kind == PyScopeKind::Class && s.pos < pos && pos < s.end)
@@ -740,85 +768,6 @@ fn py_chain_at(scopes: &[PyScope], pos: usize) -> Option<String> {
     } else {
         Some(scope.chain.join("."))
     }
-}
-
-/// The source with the text of the strings and of the comments blanked out.
-///
-/// The blanks keep the length of the source, so that an offset in the
-/// masked source is the offset in the source itself. A definition that is
-/// written in a docstring is then not read as a definition.
-fn mask_python_code(source: &str) -> String {
-    let chars: Vec<char> = source.chars().collect();
-    let mut out = String::with_capacity(source.len());
-    let mut i = 0usize;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '#' {
-            // A comment runs to the end of the line.
-            while i < chars.len() && chars[i] != '\n' {
-                out.push(' ');
-                i += 1;
-            }
-            continue;
-        }
-        if c != '"' && c != '\'' {
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        let quote = c;
-        // A string of three quotes may hold a line break.
-        let triple = i + 2 < chars.len() && chars[i + 1] == quote && chars[i + 2] == quote;
-        let open = if triple { 3 } else { 1 };
-        for _ in 0..open {
-            out.push(quote);
-            i += 1;
-        }
-        loop {
-            if i >= chars.len() {
-                break;
-            }
-            if !triple && chars[i] == '\\' {
-                out.push(' ');
-                i += 1;
-                if i < chars.len() {
-                    if chars[i] == '\n' {
-                        out.push('\n');
-                    } else {
-                        out.push(' ');
-                    }
-                    i += 1;
-                }
-                continue;
-            }
-            if triple {
-                if i + 2 < chars.len()
-                    && chars[i] == quote
-                    && chars[i + 1] == quote
-                    && chars[i + 2] == quote
-                {
-                    // The string of three quotes is one statement, so the
-                    // lines it holds are blanked out as well.
-                    for _ in 0..3 {
-                        out.push(' ');
-                    }
-                    i += 3;
-                    break;
-                }
-            } else if chars[i] == quote {
-                out.push(quote);
-                i += 1;
-                break;
-            }
-            if chars[i] == '\n' {
-                out.push('\n');
-            } else {
-                out.push(' ');
-            }
-            i += 1;
-        }
-    }
-    out
 }
 
 /// The indentation of the line the given offset is on.
@@ -837,11 +786,7 @@ fn line_indent(source: &str, pos: usize) -> usize {
 /// with a dollar sign, Python with a dot. Only the classes that enclose the
 /// method count, so that a file level function is not read as a method of
 /// the class above it.
-fn enclosing_class_decls<'a>(
-    decls: &'a [ClassDecl],
-    pos: usize,
-    indent: usize,
-) -> Vec<&'a ClassDecl> {
+fn enclosing_class_decls(decls: &[ClassDecl], pos: usize, indent: usize) -> Vec<&ClassDecl> {
     let mut chain: Vec<&ClassDecl> = Vec::new();
     let mut chain_indent = 0usize;
     for d in decls.iter().filter(|d| d.pos < pos && d.indent < indent) {
@@ -975,6 +920,12 @@ impl ModuleExports {
 /// The names a module publishes.
 fn module_exports(source: &str) -> ModuleExports {
     let mut out = ModuleExports::default();
+    // A comment or a string may hold an export that the module does not
+    // make, so the comments and the strings are blanked out before the
+    // names are looked for. A module that publishes a class in a comment
+    // publishes nothing at all.
+    let masked = mask_c_style_code(source);
+    let source = masked.as_str();
     // An export list: "export { A, B as C }".
     let list = Regex::new(r"(?m)\bexport\s*\{([^}]*)\}").unwrap();
     for caps in list.captures_iter(source) {
@@ -1062,9 +1013,11 @@ fn parse_java_methods(source: &str) -> Vec<(usize, MethodSig)> {
         // returns is an object when it returns one of them. An object has
         // no C representation. A generic method whose return type is a
         // number is fine: the erasure leaves the number alone.
-        let not_callable = if type_params.is_empty() {
-            None
-        } else if type_params
+        //
+        // A method that returns a type with no C representation cannot be
+        // called from C at all, whether it is generic or not: the value it
+        // returns could never be handed to the caller.
+        let not_callable = if type_params
             .iter()
             .any(|t| normalize_type_name(t) == normalize_type_name(&return_type))
         {
@@ -1073,14 +1026,8 @@ fn parse_java_methods(source: &str) -> Vec<(usize, MethodSig)> {
                 name,
                 return_type.trim()
             ))
-        } else if !java_type_is_representable(&return_type) {
-            Some(format!(
-                "the method \"{}\" returns a \"{}\", which has no representation in C",
-                name,
-                return_type.trim()
-            ))
         } else {
-            None
+            jvm_return_is_not_representable(&name, &return_type)
         };
         methods.push((
             caps.get(4).unwrap().start(),
@@ -1108,9 +1055,16 @@ fn parse_java_methods(source: &str) -> Vec<(usize, MethodSig)> {
 ///
 /// The bridge hands a number, a boolean or a text to the C caller. Every
 /// other type - a list, a map, an object - has no C representation, and a
-/// method that returns one cannot be called from C.
+/// method that returns one cannot be called from C. The void of Java is the
+/// void of C, so a method that returns nothing is fine.
 fn java_type_is_representable(raw_type: &str) -> bool {
-    let normalized = normalize_type_name(raw_type);
+    let raw = raw_type.trim();
+    // The boxed type of a void is an object, and an object has no C
+    // representation: only the void itself is one.
+    if raw == "Void" || raw == "java.lang.Void" || raw.ends_with(".Void") {
+        return false;
+    }
+    let normalized = normalize_type_name(raw);
     // The package of a type says nothing about what it holds, so only the
     // name of the type counts.
     let name = normalized.rsplit('.').next().unwrap_or(&normalized);
@@ -1128,7 +1082,37 @@ fn java_type_is_representable(raw_type: &str) -> bool {
             | "integer"
             | "number"
             | "character"
+            | "void"
     )
+}
+
+/// Whether a value of the given type of a JVM language can be handed to C.
+///
+/// The rule is the rule of Java, and the void of Kotlin and Scala is the
+/// "Unit" they write, which is the void of C as well.
+fn jvm_type_is_representable(raw_type: &str) -> bool {
+    if normalize_type_name(raw_type) == "unit" {
+        return true;
+    }
+    java_type_is_representable(raw_type)
+}
+
+/// The reason why a method of a JVM language cannot be called from C,
+/// because the value it returns has no C representation.
+fn jvm_return_is_not_representable(name: &str, return_type: &str) -> Option<String> {
+    // A method that declares no return type at all returns nothing, and
+    // nothing is a value C knows.
+    if return_type.trim().is_empty() {
+        return None;
+    }
+    if jvm_type_is_representable(return_type) {
+        return None;
+    }
+    Some(format!(
+        "the method \"{}\" returns a \"{}\", which has no representation in C",
+        name,
+        return_type.trim()
+    ))
 }
 
 /// Parse Kotlin method signatures: `fun <name>(<params>): <rtype>`
@@ -1158,6 +1142,10 @@ fn parse_kotlin_methods(source: &str) -> Vec<(usize, MethodSig)> {
             .get(4)
             .map(|m| m.as_str().to_string())
             .unwrap_or_default();
+        // A method that returns a type with no C representation cannot be
+        // called from C: the value it returns could never be handed to the
+        // caller.
+        let not_callable = jvm_return_is_not_representable(&name, &return_type);
         methods.push((
             caps.get(2).unwrap().start(),
             MethodSig {
@@ -1171,7 +1159,7 @@ fn parse_kotlin_methods(source: &str) -> Vec<(usize, MethodSig)> {
                 receiver_table: None,
                 py: PyFlags::default(),
                 property: false,
-                not_callable: None,
+                not_callable,
                 needs_instance: false,
                 not_exposed: None,
             },
@@ -1194,6 +1182,10 @@ fn parse_scala_methods(source: &str) -> Vec<(usize, MethodSig)> {
             .get(3)
             .map(|m| m.as_str().to_string())
             .unwrap_or_default();
+        // A method that returns a type with no C representation cannot be
+        // called from C: the value it returns could never be handed to the
+        // caller.
+        let not_callable = jvm_return_is_not_representable(&name, &return_type);
         methods.push((
             caps.get(1).unwrap().start(),
             MethodSig {
@@ -1207,7 +1199,7 @@ fn parse_scala_methods(source: &str) -> Vec<(usize, MethodSig)> {
                 receiver_table: None,
                 py: PyFlags::default(),
                 property: false,
-                not_callable: None,
+                not_callable,
                 needs_instance: false,
                 not_exposed: None,
             },
@@ -1430,10 +1422,10 @@ fn python_body_yields(source: &str, pos: usize) -> bool {
             // The block of the definition ends here.
             break;
         }
-        if let Some(rest) = trimmed.strip_prefix("yield") {
-            if !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
-                return true;
-            }
+        if let Some(rest) = trimmed.strip_prefix("yield")
+            && !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_')
+        {
+            return true;
         }
     }
     false

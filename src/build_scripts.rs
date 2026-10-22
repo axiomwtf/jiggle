@@ -109,7 +109,7 @@ pub fn generate_build_sh(
     // Generate dependency files restoration commands
     script.push_str("# Restore dependencies\n");
 
-    for (lang, _entries) in &manifest.dependencies {
+    for lang in manifest.dependencies.keys() {
         let dep_file = crate::deps::get_dep_filename(lang, custom_languages)?;
         let restore_cmd = get_dependency_restore_cmd_unix(lang);
 
@@ -195,7 +195,7 @@ pub fn generate_build_sh(
             &ffi_header_source(&exposed),
             "",
         );
-        script.push_str("\n");
+        script.push('\n');
         // The header is kept next to the binary right away, so that a build
         // that fails later still shows the prototypes of the methods.
         script.push_str("cp jgl_ffi.h ../jgl_ffi.h 2>/dev/null || true\n");
@@ -210,100 +210,137 @@ pub fn generate_build_sh(
     // When a main._rs file exists, Rust is the main linker and compiles to a binary.
     // Otherwise, each .rs file is compiled to an object file and linked alongside
     // the other language objects.
-    if let Some(files) = files_by_lang.get("rs") {
-        if !files.is_empty() {
-            let has_cargo = vfs.contains("Cargo.toml");
-            let has_rust_main = files
-                .iter()
-                .any(|f| f.contains("main") || f.contains("main._rs") || f.ends_with("main.rs"));
+    if let Some(files) = files_by_lang.get("rs")
+        && !files.is_empty()
+    {
+        let has_cargo = vfs.contains("Cargo.toml");
+        let has_rust_main = files
+            .iter()
+            .any(|f| f.contains("main") || f.contains("main._rs") || f.ends_with("main.rs"));
 
-            // Determine if Rust acts as the main linker (has its own main entry point)
-            let rust_is_main = has_rust_main;
+        // Determine if Rust acts as the main linker (has its own main entry point)
+        let rust_is_main = has_rust_main;
 
-            if rust_is_main && has_cargo {
-                // Cargo.toml + Rust main: use cargo build
-                script.push_str("# Rust with Cargo.toml - full cargo build\n");
-                if target_win {
-                    script.push_str("if command -v rustup &> /dev/null; then\n");
-                } else {
-                    script.push_str("if command -v cargo &> /dev/null; then\n");
-                }
-                script.push_str("    echo \"Step 0: Creating dummy lib file for cargo...\"\n");
-                script.push_str("    echo '' > jgl_dummy.rs\n");
-                if target_win {
-                    script.push_str(
-                        "    echo \"Step 1: Building with cargo (cross-compiled to Windows)...\"\n",
-                    );
-                    script.push_str("    rustup run stable cargo build --release --target x86_64-pc-windows-gnu 2>&1 || echo \"Warning: cargo build had issues\"\n");
-                } else {
-                    script.push_str("    echo \"Step 1: Building with cargo...\"\n");
-                    script.push_str(
-                        "    cargo build 2>&1 || echo \"Warning: cargo build had issues\"\n",
-                    );
-                }
-                script.push_str("    echo \"Step 2: Copying binary...\"\n");
-                if target_win {
-                    script.push_str(&format!("    cp target/x86_64-pc-windows-gnu/release/{bin_name}.exe . 2>/dev/null || true\n"));
-                } else {
-                    script.push_str(&format!("    cp target/release/{bin_name} . 2>/dev/null || cp target/debug/{bin_name} . 2>/dev/null || true\n"));
-                }
-                script.push_str("else\n");
-                script.push_str("    echo \"Warning: cargo not found, skipping Rust\"\n");
-                script.push_str("fi\n\n");
-            } else if rust_is_main && !has_cargo {
-                // No Cargo.toml but has Rust main: compile combined crate to binary
-                script.push_str("# Rust (no Cargo.toml, has main) - compiling to binary\n");
-                if target_win {
-                    script.push_str("if command -v rustup &> /dev/null; then\n");
-                } else {
-                    script.push_str("if command -v rustc &> /dev/null; then\n");
-                }
-                script.push_str("    COMBINED_RS=\"jgl_combined_main.rs\"\n");
-                script.push_str("    echo '#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]' > \"$COMBINED_RS\"\n");
-                // Fix #[no_mangle] for Rust 2024 edition
-                script.push_str("    for f in *.rs; do\n");
-                script.push_str("        sed 's/#\\[no_mangle\\]/#[unsafe(no_mangle)]/g' \"$f\" > \"_${f}\" 2>/dev/null || true\n");
-                script.push_str("    done\n");
-                // Add module declarations for all .rs files
-                for f in files {
-                    let module_name = Path::new(f)
-                        .file_stem()
-                        .unwrap()
-                        .to_string_lossy()
-                        .to_string();
-                    script.push_str(&format!(
-                        "    echo 'mod {};' >> \"$COMBINED_RS\"\n",
-                        module_name
-                    ));
-                }
-                script.push_str("    echo '' >> \"$COMBINED_RS\"\n");
-                // Append all .rs content (strip suppressor line from first file)
-                script.push_str("    for f in *.rs; do\n");
+        if rust_is_main && has_cargo {
+            // Cargo.toml + Rust main: use cargo build
+            script.push_str("# Rust with Cargo.toml - full cargo build\n");
+            if target_win {
+                script.push_str("if command -v rustup &> /dev/null; then\n");
+            } else {
+                script.push_str("if command -v cargo &> /dev/null; then\n");
+            }
+            script.push_str("    echo \"Step 0: Creating dummy lib file for cargo...\"\n");
+            script.push_str("    echo '' > jgl_dummy.rs\n");
+            if target_win {
                 script.push_str(
-                    "        cat \"_${f}\" | tail -n +2 >> \"$COMBINED_RS\" 2>/dev/null || true\n",
+                    "    echo \"Step 1: Building with cargo (cross-compiled to Windows)...\"\n",
                 );
-                script.push_str("    done\n");
-                script.push_str("    LINK_ARGS=\"\"\n");
-                script.push_str("    for go_a in *_0.a; do\n");
-                script.push_str("        if [ -f \"$go_a\" ]; then LINK_ARGS=\"$LINK_ARGS -C link-arg=$go_a\"; fi\n");
-                script.push_str("    done\n");
-                script.push_str("    for embed in embed_*.o; do\n");
-                script.push_str("        if [ -f \"$embed\" ]; then LINK_ARGS=\"$LINK_ARGS -C link-arg=$embed\"; fi\n");
-                script.push_str("    done\n");
-                script.push_str("    for native in native_*.o; do\n");
-                script.push_str("        if [ -f \"$native\" ]; then LINK_ARGS=\"$LINK_ARGS -C link-arg=$native\"; fi\n");
-                script.push_str("    done\n");
-                if target_win {
-                    script.push_str("    LINK_ARGS=\"$LINK_ARGS -C link-arg=-lm\"\n");
-                } else {
-                    script.push_str("    LINK_ARGS=\"$LINK_ARGS -C link-arg=-lm -C link-arg=-lpthread -C link-arg=-ldl\"\n");
-                }
-                let bin_name_rs = if target_win {
-                    format!("{}.exe", bin_name)
-                } else {
-                    bin_name.to_string()
-                };
-                let target_flag = if target_win {
+                script.push_str("    rustup run stable cargo build --release --target x86_64-pc-windows-gnu 2>&1 || echo \"Warning: cargo build had issues\"\n");
+            } else {
+                script.push_str("    echo \"Step 1: Building with cargo...\"\n");
+                script
+                    .push_str("    cargo build 2>&1 || echo \"Warning: cargo build had issues\"\n");
+            }
+            script.push_str("    echo \"Step 2: Copying binary...\"\n");
+            if target_win {
+                script.push_str(&format!("    cp target/x86_64-pc-windows-gnu/release/{bin_name}.exe . 2>/dev/null || true\n"));
+            } else {
+                script.push_str(&format!("    cp target/release/{bin_name} . 2>/dev/null || cp target/debug/{bin_name} . 2>/dev/null || true\n"));
+            }
+            script.push_str("else\n");
+            script.push_str("    echo \"Warning: cargo not found, skipping Rust\"\n");
+            script.push_str("fi\n\n");
+        } else if rust_is_main && !has_cargo {
+            // No Cargo.toml but has Rust main: compile combined crate to binary
+            script.push_str("# Rust (no Cargo.toml, has main) - compiling to binary\n");
+            if target_win {
+                script.push_str("if command -v rustup &> /dev/null; then\n");
+            } else {
+                script.push_str("if command -v rustc &> /dev/null; then\n");
+            }
+            script.push_str("    COMBINED_RS=\"jgl_combined_main.rs\"\n");
+            script.push_str("    echo '#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]' > \"$COMBINED_RS\"\n");
+            // Fix #[no_mangle] for Rust 2024 edition
+            script.push_str("    for f in *.rs; do\n");
+            script.push_str("        sed 's/#\\[no_mangle\\]/#[unsafe(no_mangle)]/g' \"$f\" > \"_${f}\" 2>/dev/null || true\n");
+            script.push_str("    done\n");
+            // Add module declarations for all .rs files
+            for f in files {
+                let module_name = Path::new(f)
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+                script.push_str(&format!(
+                    "    echo 'mod {};' >> \"$COMBINED_RS\"\n",
+                    module_name
+                ));
+            }
+            script.push_str("    echo '' >> \"$COMBINED_RS\"\n");
+            // Append all .rs content (strip suppressor line from first file)
+            script.push_str("    for f in *.rs; do\n");
+            script.push_str(
+                "        cat \"_${f}\" | tail -n +2 >> \"$COMBINED_RS\" 2>/dev/null || true\n",
+            );
+            script.push_str("    done\n");
+            script.push_str("    LINK_ARGS=\"\"\n");
+            script.push_str("    for go_a in *_0.a; do\n");
+            script.push_str("        if [ -f \"$go_a\" ]; then LINK_ARGS=\"$LINK_ARGS -C link-arg=$go_a\"; fi\n");
+            script.push_str("    done\n");
+            script.push_str("    for embed in embed_*.o; do\n");
+            script.push_str("        if [ -f \"$embed\" ]; then LINK_ARGS=\"$LINK_ARGS -C link-arg=$embed\"; fi\n");
+            script.push_str("    done\n");
+            script.push_str("    for native in native_*.o; do\n");
+            script.push_str("        if [ -f \"$native\" ]; then LINK_ARGS=\"$LINK_ARGS -C link-arg=$native\"; fi\n");
+            script.push_str("    done\n");
+            if target_win {
+                script.push_str("    LINK_ARGS=\"$LINK_ARGS -C link-arg=-lm\"\n");
+            } else {
+                script.push_str("    LINK_ARGS=\"$LINK_ARGS -C link-arg=-lm -C link-arg=-lpthread -C link-arg=-ldl\"\n");
+            }
+            let bin_name_rs = if target_win {
+                format!("{}.exe", bin_name)
+            } else {
+                bin_name.to_string()
+            };
+            let target_flag = if target_win {
+                " --target=x86_64-pc-windows-gnu"
+            } else {
+                ""
+            };
+            let rustc_cmd = if target_win {
+                "rustup run stable rustc"
+            } else {
+                "rustc"
+            };
+            script.push_str(&format!("    {rustc_cmd} --edition 2024 -O -o {} --crate-type=bin{target_flag} \"$COMBINED_RS\" $LINK_ARGS 2>&1 || echo \"Warning: Rust linking failed\"\n", bin_name_rs, target_flag=target_flag, rustc_cmd=rustc_cmd));
+            script.push_str(&format!(
+                "    if [ -f {} ]; then echo \"Linked unified native binary: {}\"; fi\n",
+                bin_name_rs, bin_name_rs
+            ));
+            script.push_str("else\n");
+            script.push_str("    echo \"Warning: Rust compiler (rustc) not found, skipping Rust compilation\"\n");
+            script.push_str("fi\n\n");
+        } else {
+            // No Rust main: compile each .rs file to object file, link with others
+            script.push_str("# Rust (no main _rs) - compiling to object files for linking\n");
+            if target_win {
+                script.push_str("if command -v rustup &> /dev/null; then\n");
+            } else {
+                script.push_str("if command -v rustc &> /dev/null; then\n");
+            }
+            for f in files {
+                let out_name = format!("rust_{}.o", f.replace(".rs", ""));
+                object_files.push(out_name.clone());
+                native_objects.push(out_name.clone());
+                script.push_str(&format!("    echo \"Compiling Rust: {}\"\n", f));
+                // Fix #[no_mangle] -> #[unsafe(no_mangle)] for rustc 1.82+
+                script.push_str(&format!(
+                    "    sed 's/#\\[no_mangle\\]/#[unsafe(no_mangle)]/g' {} > _{}_fixed.rs\n",
+                    sh_quote(f),
+                    f.replace(".rs", "")
+                ));
+                let rustc_win_target = if target_win {
                     " --target=x86_64-pc-windows-gnu"
                 } else {
                     ""
@@ -313,380 +350,346 @@ pub fn generate_build_sh(
                 } else {
                     "rustc"
                 };
-                script.push_str(&format!("    {rustc_cmd} --edition 2024 -O -o {} --crate-type=bin{target_flag} \"$COMBINED_RS\" $LINK_ARGS 2>&1 || echo \"Warning: Rust linking failed\"\n", bin_name_rs, target_flag=target_flag, rustc_cmd=rustc_cmd));
-                script.push_str(&format!(
-                    "    if [ -f {} ]; then echo \"Linked unified native binary: {}\"; fi\n",
-                    bin_name_rs, bin_name_rs
-                ));
-                script.push_str("else\n");
-                script.push_str("    echo \"Warning: Rust compiler (rustc) not found, skipping Rust compilation\"\n");
-                script.push_str("fi\n\n");
-            } else {
-                // No Rust main: compile each .rs file to object file, link with others
-                script.push_str("# Rust (no main _rs) - compiling to object files for linking\n");
-                if target_win {
-                    script.push_str("if command -v rustup &> /dev/null; then\n");
-                } else {
-                    script.push_str("if command -v rustc &> /dev/null; then\n");
-                }
-                for f in files {
-                    let out_name = format!("rust_{}.o", f.replace(".rs", ""));
-                    object_files.push(out_name.clone());
-                    native_objects.push(out_name.clone());
-                    script.push_str(&format!("    echo \"Compiling Rust: {}\"\n", f));
-                    // Fix #[no_mangle] -> #[unsafe(no_mangle)] for rustc 1.82+
-                    script.push_str(&format!(
-                        "    sed 's/#\\[no_mangle\\]/#[unsafe(no_mangle)]/g' {} > _{}_fixed.rs\n",
-                        sh_quote(f),
-                        f.replace(".rs", "")
-                    ));
-                    let rustc_win_target = if target_win {
-                        " --target=x86_64-pc-windows-gnu"
-                    } else {
-                        ""
-                    };
-                    let rustc_cmd = if target_win {
-                        "rustup run stable rustc"
-                    } else {
-                        "rustc"
-                    };
-                    script.push_str(&format!("    {} --edition 2024 -O --crate-type=lib --emit=obj -o {} _{}_fixed.rs{} 2>&1 || echo \"Warning: Rust compilation failed for {}\"\n",
+                script.push_str(&format!("    {} --edition 2024 -O --crate-type=lib --emit=obj -o {} _{}_fixed.rs{} 2>&1 || echo \"Warning: Rust compilation failed for {}\"\n",
                         rustc_cmd, sh_quote(&out_name), f.replace(".rs", ""), rustc_win_target, sh_quote(f)));
-                }
-                script.push_str("else\n");
-                script.push_str("    echo \"Warning: Rust compiler (rustc) not found, skipping Rust compilation\"\n");
-                script.push_str("fi\n\n");
-            }
-        }
-    }
-
-    // Go compilation - compile to static archives for linking
-    if let Some(files) = files_by_lang.get("go") {
-        if !files.is_empty() {
-            if target_win {
-                script.push_str("# Go (cross-compiled to Windows)\n");
-                script.push_str("if command -v go &> /dev/null; then\n");
-                for (i, f) in files.iter().enumerate() {
-                    let a_name = f.replace(".go", &format!("_{}.a", i));
-                    script.push_str(&format!("    echo \"Compiling Go: {}\"\n", f));
-                    script.push_str(&format!("    GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc go build -buildmode=c-archive -o {} {} 2>&1 || echo \"Warning: Go compilation failed for {}\"\n",
-                        sh_quote(&a_name), sh_quote(f), sh_quote(f)));
-                }
-                script.push_str("else\n");
-                script.push_str(
-                    "    echo \"Warning: Go compiler (go) not found, skipping Go compilation\"\n",
-                );
-                script.push_str("fi\n\n");
-            } else {
-                script.push_str("# Go - compiled as C archives for static linking\n");
-                script.push_str("if command -v go &> /dev/null; then\n");
-                for (i, f) in files.iter().enumerate() {
-                    let a_name = f.replace(".go", &format!("_{}.a", i));
-                    // Use the .a archive directly as linker input (contains Go runtime + cgo)
-                    script.push_str(&format!("    echo \"Compiling Go: {}\"\n", f));
-                    script.push_str(&format!("    go build -buildmode=c-archive -o {} {} 2>&1 || echo \"Warning: Go compilation failed for {}\"\n",
-                        sh_quote(&a_name), sh_quote(f), sh_quote(f)));
-                }
-                script.push_str("else\n");
-                script.push_str(
-                    "    echo \"Warning: Go compiler (go) not found, skipping Go compilation\"\n",
-                );
-                script.push_str("fi\n\n");
-            }
-        }
-    }
-    // C compilation
-    if let Some(c_files) = files_by_lang.get("c") {
-        if !c_files.is_empty() {
-            if target_win {
-                script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then\n");
-                script.push_str("        CC=x86_64-w64-mingw32-gcc\n");
-                script.push_str("    elif command -v clang &> /dev/null; then\n");
-                script.push_str("        CC=\"clang --target=x86_64-pc-windows-gnu\"\n");
-                script.push_str("    else\n");
-                script.push_str("        echo \"Warning: No Windows C compiler found (mingw-w64 or clang), skipping C compilation\"\n");
-                script.push_str("    fi\n");
-            } else {
-                script.push_str("    if command -v clang &> /dev/null; then\n");
-                script.push_str("        CC=clang\n");
-                script.push_str("    elif command -v gcc &> /dev/null; then\n");
-                script.push_str("        CC=gcc\n");
-                script.push_str("    else\n");
-                script.push_str("        echo \"Warning: No C compiler found (clang or gcc), skipping C compilation\"\n");
-                script.push_str("    fi\n");
-            }
-            for f in c_files {
-                let out_name = f.replace(".c", ".o");
-                object_files.push(out_name.clone());
-                native_objects.push(out_name.clone());
-                script.push_str(&format!("if [ -n \"${{CC:-}}\" ]; then $CC -O2 -c -o {} {} || {{ echo \"error: the C source {} did not compile\" >&2; exit 1; }}; fi\n", sh_quote(&out_name), sh_quote(f), sh_quote(f)));
-            }
-            script.push_str("\n");
-        }
-    }
-
-    // C++ compilation
-    if let Some(cpp_files) = files_by_lang.get("cpp") {
-        if !cpp_files.is_empty() {
-            script.push_str("# C++\n");
-            script.push_str(
-                "# Note: C++ functions must be wrapped in extern \"C\" for cross-language FFI\n",
-            );
-            if target_win {
-                script.push_str("    if command -v x86_64-w64-mingw32-g++ &> /dev/null; then\n");
-                script.push_str("        CXX=x86_64-w64-mingw32-g++\n");
-                script.push_str("    elif command -v clang++ &> /dev/null; then\n");
-                script.push_str("        CXX=\"clang++ --target=x86_64-pc-windows-gnu\"\n");
-                script.push_str("    else\n");
-                script.push_str("        echo \"Warning: No Windows C++ compiler found (mingw-w64 or clang++), skipping C++ compilation\"\n");
-                script.push_str("    fi\n");
-            } else {
-                script.push_str("    if command -v clang++ &> /dev/null; then\n");
-                script.push_str("        CXX=clang++\n");
-                script.push_str("    elif command -v g++ &> /dev/null; then\n");
-                script.push_str("        CXX=g++\n");
-                script.push_str("    else\n");
-                script.push_str("        echo \"Warning: No C++ compiler found (clang++ or g++), skipping C++ compilation\"\n");
-                script.push_str("    fi\n");
-            }
-            for f in cpp_files {
-                let out_name = f.replace(".cpp", ".o");
-                object_files.push(out_name.clone());
-                native_objects.push(out_name.clone());
-                script.push_str(&format!("if [ -n \"${{CXX:-}}\" ]; then $CXX -O2 -c -o {} {} || echo \"Warning: Failed to compile {}\"; fi\n", sh_quote(&out_name), sh_quote(f), sh_quote(f)));
-            }
-            script.push_str("\n");
-        }
-    }
-
-    // Zig compilation
-    if let Some(files) = files_by_lang.get("zig") {
-        if !files.is_empty() {
-            let zig_target = if target_win {
-                " -Dtarget=x86_64-windows-gnu"
-            } else {
-                ""
-            };
-            script.push_str("# Zig\n");
-            script.push_str("if command -v zig &> /dev/null; then\n");
-            for f in files {
-                let out_name = format!("zig_{}.o", f.replace(".zig", ""));
-                object_files.push(out_name.clone());
-                native_objects.push(out_name.clone());
-                script.push_str(&format!("    zig build-obj -O ReleaseSmall -femit-bin={} {}{} 2>&1 || echo \"Warning: Failed to compile {}\"\n", sh_quote(&out_name), sh_quote(f), zig_target, sh_quote(f)));
             }
             script.push_str("else\n");
-            script.push_str(
-                "    echo \"Warning: Zig compiler (zig) not found, skipping Zig compilation\"\n",
-            );
+            script.push_str("    echo \"Warning: Rust compiler (rustc) not found, skipping Rust compilation\"\n");
             script.push_str("fi\n\n");
         }
     }
 
-    // Nim compilation
-    if let Some(files) = files_by_lang.get("nim") {
-        if !files.is_empty() {
-            if target_win {
-                script.push_str("# Nim (cross-compiled to Windows)\n");
-                script.push_str("if command -v nim &> /dev/null; then\n");
-                for f in files {
-                    let out_name = format!("nim_{}.o", f.replace(".nim", ""));
-                    let nim_obj = format!("nimcache_nim/@m{}.c.o", f.replace("/", "@"));
-                    script.push_str(&format!("    CC=x86_64-w64-mingw32-gcc nim c --noLinking -d:release -d:mingw --cpu:amd64 --passC:\"-I/usr/x86_64-w64-mingw32/include\" --passC:\"--sysroot=/usr/x86_64-w64-mingw32\" --nimcache:nimcache_nim -o:{} {} 2>&1 || echo \"Warning: Failed to compile {}\"\n", sh_quote(&out_name), sh_quote(f), sh_quote(f)));
-                    let base_name = f.replace(".nim", "");
-                    script.push_str(&format!("    objcopy --redefine-sym main=nim_main_{} {} 2>/dev/null || echo \"Warning: objcopy failed for {}\"\n", sh_quote(&base_name), sh_quote(&nim_obj), sh_quote(&base_name)));
-                    script.push_str(&format!(
-                        "    NATIVE_OBJECTS=\"$NATIVE_OBJECTS {}\"\n",
-                        nim_obj
-                    ));
-                }
-                // Collect all Nim runtime objects from nimcache (system.nim, etc.)
-                script.push_str("            for no in nimcache_nim/*.o; do\n");
-                script.push_str("                if [ -f \"$no\" ]; then NATIVE_OBJECTS=\"$NATIVE_OBJECTS $no\"; fi\n");
-                script.push_str("            done\n");
-                script.push_str("            # Deduplicate NATIVE_OBJECTS\n");
-                script.push_str("            NATIVE_OBJECTS=$(echo $NATIVE_OBJECTS | tr ' ' '\\n' | sort -u | tr '\\n' ' ')\n");
-                script.push_str("else\n");
-                script.push_str("    echo \"Warning: Nim compiler (nim) not found, skipping Nim compilation\"\n");
-                script.push_str("fi\n\n");
-            } else {
-                script.push_str("# Nim\n");
-                script.push_str("if command -v nim &> /dev/null; then\n");
-                for f in files {
-                    let out_name = format!("nim_{}.o", f.replace(".nim", ""));
-                    let nim_obj = format!("nimcache_nim/@m{}.c.o", f.replace("/", "@"));
-                    script.push_str(&format!("    nim c --noLinking --passC:-O2 --passC:-fPIC --nimcache:nimcache_nim -o:{} {} 2>&1 || echo \"Warning: Failed to compile {}\"\n", sh_quote(&out_name), sh_quote(f), sh_quote(f)));
-                    let base_name = f.replace(".nim", "");
-                    script.push_str(&format!(
-                        "    objcopy --redefine-sym main=nim_main_{} {} 2>/dev/null || true\n",
-                        sh_quote(&base_name),
-                        sh_quote(&nim_obj)
-                    ));
-                    script.push_str(&format!(
-                        "    NATIVE_OBJECTS=\"$NATIVE_OBJECTS {}\"\n",
-                        nim_obj
-                    ));
-                }
-                // Collect all Nim runtime objects from nimcache (system.nim, etc.)
-                script.push_str("            for no in nimcache_nim/*.o; do\n");
-                script.push_str("                if [ -f \"$no\" ]; then NATIVE_OBJECTS=\"$NATIVE_OBJECTS $no\"; fi\n");
-                script.push_str("            done\n");
-                // Remove duplicate main module objects (already added with renamed main)
-                script.push_str("            # Deduplicate NATIVE_OBJECTS\n");
-                script.push_str("            NATIVE_OBJECTS=$(echo $NATIVE_OBJECTS | tr ' ' '\\n' | sort -u | tr '\\n' ' ')\n");
-                script.push_str("else\n");
-                script.push_str("    echo \"Warning: Nim compiler (nim) not found, skipping Nim compilation\"\n");
-                script.push_str("fi\n\n");
+    // Go compilation - compile to static archives for linking
+    if let Some(files) = files_by_lang.get("go")
+        && !files.is_empty()
+    {
+        if target_win {
+            script.push_str("# Go (cross-compiled to Windows)\n");
+            script.push_str("if command -v go &> /dev/null; then\n");
+            for (i, f) in files.iter().enumerate() {
+                let a_name = f.replace(".go", &format!("_{}.a", i));
+                script.push_str(&format!("    echo \"Compiling Go: {}\"\n", f));
+                script.push_str(&format!("    GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc go build -buildmode=c-archive -o {} {} 2>&1 || echo \"Warning: Go compilation failed for {}\"\n",
+                        sh_quote(&a_name), sh_quote(f), sh_quote(f)));
             }
+            script.push_str("else\n");
+            script.push_str(
+                "    echo \"Warning: Go compiler (go) not found, skipping Go compilation\"\n",
+            );
+            script.push_str("fi\n\n");
+        } else {
+            script.push_str("# Go - compiled as C archives for static linking\n");
+            script.push_str("if command -v go &> /dev/null; then\n");
+            for (i, f) in files.iter().enumerate() {
+                let a_name = f.replace(".go", &format!("_{}.a", i));
+                // Use the .a archive directly as linker input (contains Go runtime + cgo)
+                script.push_str(&format!("    echo \"Compiling Go: {}\"\n", f));
+                script.push_str(&format!("    go build -buildmode=c-archive -o {} {} 2>&1 || echo \"Warning: Go compilation failed for {}\"\n",
+                        sh_quote(&a_name), sh_quote(f), sh_quote(f)));
+            }
+            script.push_str("else\n");
+            script.push_str(
+                "    echo \"Warning: Go compiler (go) not found, skipping Go compilation\"\n",
+            );
+            script.push_str("fi\n\n");
+        }
+    }
+    // C compilation
+    if let Some(c_files) = files_by_lang.get("c")
+        && !c_files.is_empty()
+    {
+        if target_win {
+            script.push_str("    if command -v x86_64-w64-mingw32-gcc &> /dev/null; then\n");
+            script.push_str("        CC=x86_64-w64-mingw32-gcc\n");
+            script.push_str("    elif command -v clang &> /dev/null; then\n");
+            script.push_str("        CC=\"clang --target=x86_64-pc-windows-gnu\"\n");
+            script.push_str("    else\n");
+            script.push_str("        echo \"Warning: No Windows C compiler found (mingw-w64 or clang), skipping C compilation\"\n");
+            script.push_str("    fi\n");
+        } else {
+            script.push_str("    if command -v clang &> /dev/null; then\n");
+            script.push_str("        CC=clang\n");
+            script.push_str("    elif command -v gcc &> /dev/null; then\n");
+            script.push_str("        CC=gcc\n");
+            script.push_str("    else\n");
+            script.push_str("        echo \"Warning: No C compiler found (clang or gcc), skipping C compilation\"\n");
+            script.push_str("    fi\n");
+        }
+        for f in c_files {
+            let out_name = f.replace(".c", ".o");
+            object_files.push(out_name.clone());
+            native_objects.push(out_name.clone());
+            script.push_str(&format!("if [ -n \"${{CC:-}}\" ]; then $CC -O2 -c -o {} {} || {{ echo \"error: the C source {} did not compile\" >&2; exit 1; }}; fi\n", sh_quote(&out_name), sh_quote(f), sh_quote(f)));
+        }
+        script.push('\n');
+    }
+
+    // C++ compilation
+    if let Some(cpp_files) = files_by_lang.get("cpp")
+        && !cpp_files.is_empty()
+    {
+        script.push_str("# C++\n");
+        script.push_str(
+            "# Note: C++ functions must be wrapped in extern \"C\" for cross-language FFI\n",
+        );
+        if target_win {
+            script.push_str("    if command -v x86_64-w64-mingw32-g++ &> /dev/null; then\n");
+            script.push_str("        CXX=x86_64-w64-mingw32-g++\n");
+            script.push_str("    elif command -v clang++ &> /dev/null; then\n");
+            script.push_str("        CXX=\"clang++ --target=x86_64-pc-windows-gnu\"\n");
+            script.push_str("    else\n");
+            script.push_str("        echo \"Warning: No Windows C++ compiler found (mingw-w64 or clang++), skipping C++ compilation\"\n");
+            script.push_str("    fi\n");
+        } else {
+            script.push_str("    if command -v clang++ &> /dev/null; then\n");
+            script.push_str("        CXX=clang++\n");
+            script.push_str("    elif command -v g++ &> /dev/null; then\n");
+            script.push_str("        CXX=g++\n");
+            script.push_str("    else\n");
+            script.push_str("        echo \"Warning: No C++ compiler found (clang++ or g++), skipping C++ compilation\"\n");
+            script.push_str("    fi\n");
+        }
+        for f in cpp_files {
+            let out_name = f.replace(".cpp", ".o");
+            object_files.push(out_name.clone());
+            native_objects.push(out_name.clone());
+            script.push_str(&format!("if [ -n \"${{CXX:-}}\" ]; then $CXX -O2 -c -o {} {} || echo \"Warning: Failed to compile {}\"; fi\n", sh_quote(&out_name), sh_quote(f), sh_quote(f)));
+        }
+        script.push('\n');
+    }
+
+    // Zig compilation
+    if let Some(files) = files_by_lang.get("zig")
+        && !files.is_empty()
+    {
+        let zig_target = if target_win {
+            " -Dtarget=x86_64-windows-gnu"
+        } else {
+            ""
+        };
+        script.push_str("# Zig\n");
+        script.push_str("if command -v zig &> /dev/null; then\n");
+        for f in files {
+            let out_name = format!("zig_{}.o", f.replace(".zig", ""));
+            object_files.push(out_name.clone());
+            native_objects.push(out_name.clone());
+            script.push_str(&format!("    zig build-obj -O ReleaseSmall -femit-bin={} {}{} 2>&1 || echo \"Warning: Failed to compile {}\"\n", sh_quote(&out_name), sh_quote(f), zig_target, sh_quote(f)));
+        }
+        script.push_str("else\n");
+        script.push_str(
+            "    echo \"Warning: Zig compiler (zig) not found, skipping Zig compilation\"\n",
+        );
+        script.push_str("fi\n\n");
+    }
+
+    // Nim compilation
+    if let Some(files) = files_by_lang.get("nim")
+        && !files.is_empty()
+    {
+        if target_win {
+            script.push_str("# Nim (cross-compiled to Windows)\n");
+            script.push_str("if command -v nim &> /dev/null; then\n");
+            for f in files {
+                let out_name = format!("nim_{}.o", f.replace(".nim", ""));
+                let nim_obj = format!("nimcache_nim/@m{}.c.o", f.replace("/", "@"));
+                script.push_str(&format!("    CC=x86_64-w64-mingw32-gcc nim c --noLinking -d:release -d:mingw --cpu:amd64 --passC:\"-I/usr/x86_64-w64-mingw32/include\" --passC:\"--sysroot=/usr/x86_64-w64-mingw32\" --nimcache:nimcache_nim -o:{} {} 2>&1 || echo \"Warning: Failed to compile {}\"\n", sh_quote(&out_name), sh_quote(f), sh_quote(f)));
+                let base_name = f.replace(".nim", "");
+                script.push_str(&format!("    objcopy --redefine-sym main=nim_main_{} {} 2>/dev/null || echo \"Warning: objcopy failed for {}\"\n", sh_quote(&base_name), sh_quote(&nim_obj), sh_quote(&base_name)));
+                script.push_str(&format!(
+                    "    NATIVE_OBJECTS=\"$NATIVE_OBJECTS {}\"\n",
+                    nim_obj
+                ));
+            }
+            // Collect all Nim runtime objects from nimcache (system.nim, etc.)
+            script.push_str("            for no in nimcache_nim/*.o; do\n");
+            script.push_str("                if [ -f \"$no\" ]; then NATIVE_OBJECTS=\"$NATIVE_OBJECTS $no\"; fi\n");
+            script.push_str("            done\n");
+            script.push_str("            # Deduplicate NATIVE_OBJECTS\n");
+            script.push_str("            NATIVE_OBJECTS=$(echo $NATIVE_OBJECTS | tr ' ' '\\n' | sort -u | tr '\\n' ' ')\n");
+            script.push_str("else\n");
+            script.push_str(
+                "    echo \"Warning: Nim compiler (nim) not found, skipping Nim compilation\"\n",
+            );
+            script.push_str("fi\n\n");
+        } else {
+            script.push_str("# Nim\n");
+            script.push_str("if command -v nim &> /dev/null; then\n");
+            for f in files {
+                let out_name = format!("nim_{}.o", f.replace(".nim", ""));
+                let nim_obj = format!("nimcache_nim/@m{}.c.o", f.replace("/", "@"));
+                script.push_str(&format!("    nim c --noLinking --passC:-O2 --passC:-fPIC --nimcache:nimcache_nim -o:{} {} 2>&1 || echo \"Warning: Failed to compile {}\"\n", sh_quote(&out_name), sh_quote(f), sh_quote(f)));
+                let base_name = f.replace(".nim", "");
+                script.push_str(&format!(
+                    "    objcopy --redefine-sym main=nim_main_{} {} 2>/dev/null || true\n",
+                    sh_quote(&base_name),
+                    sh_quote(&nim_obj)
+                ));
+                script.push_str(&format!(
+                    "    NATIVE_OBJECTS=\"$NATIVE_OBJECTS {}\"\n",
+                    nim_obj
+                ));
+            }
+            // Collect all Nim runtime objects from nimcache (system.nim, etc.)
+            script.push_str("            for no in nimcache_nim/*.o; do\n");
+            script.push_str("                if [ -f \"$no\" ]; then NATIVE_OBJECTS=\"$NATIVE_OBJECTS $no\"; fi\n");
+            script.push_str("            done\n");
+            // Remove duplicate main module objects (already added with renamed main)
+            script.push_str("            # Deduplicate NATIVE_OBJECTS\n");
+            script.push_str("            NATIVE_OBJECTS=$(echo $NATIVE_OBJECTS | tr ' ' '\\n' | sort -u | tr '\\n' ' ')\n");
+            script.push_str("else\n");
+            script.push_str(
+                "    echo \"Warning: Nim compiler (nim) not found, skipping Nim compilation\"\n",
+            );
+            script.push_str("fi\n\n");
         }
     }
     // Fortran compilation
-    if let Some(files) = files_by_lang.get("f90") {
-        if !files.is_empty() {
-            if target_win {
-                script.push_str("# Fortran (cross-compiled to Windows)\n");
-                script.push_str("if command -v x86_64-w64-mingw32-gfortran &> /dev/null; then\n");
-                for f in files {
-                    let out_name = format!("fortran_{}", f.replace(".f90", ".o"));
-                    object_files.push(out_name.clone());
-                    native_objects.push(out_name.clone());
-                    script.push_str(&format!("    x86_64-w64-mingw32-gfortran -fno-underscoring -O2 -c -o {} {} 2>&1 || echo \"Warning: Failed to compile {}\"\n", sh_quote(&out_name), sh_quote(f), sh_quote(f)));
-                }
-                script.push_str("else\n");
-                script.push_str("    echo \"Warning: Windows Fortran compiler (x86_64-w64-mingw32-gfortran) not found, skipping Fortran compilation\"\n");
-                script.push_str("fi\n\n");
-            } else {
-                script.push_str("# Fortran\n");
-                script.push_str("if command -v gfortran &> /dev/null; then\n");
-                for f in files {
-                    let out_name = format!("fortran_{}", f.replace(".f90", ".o"));
-                    object_files.push(out_name.clone());
-                    native_objects.push(out_name.clone());
-                    script.push_str(&format!("    gfortran -fno-underscoring -O2 -c -fPIC -o {} {} 2>&1 || echo \"Warning: Failed to compile {}\"\n", sh_quote(&out_name), sh_quote(f), sh_quote(f)));
-                }
-                script.push_str("else\n");
-                script.push_str("    echo \"Warning: Fortran compiler (gfortran) not found, skipping Fortran compilation\"\n");
-                script.push_str("fi\n\n");
+    if let Some(files) = files_by_lang.get("f90")
+        && !files.is_empty()
+    {
+        if target_win {
+            script.push_str("# Fortran (cross-compiled to Windows)\n");
+            script.push_str("if command -v x86_64-w64-mingw32-gfortran &> /dev/null; then\n");
+            for f in files {
+                let out_name = format!("fortran_{}", f.replace(".f90", ".o"));
+                object_files.push(out_name.clone());
+                native_objects.push(out_name.clone());
+                script.push_str(&format!("    x86_64-w64-mingw32-gfortran -fno-underscoring -O2 -c -o {} {} 2>&1 || echo \"Warning: Failed to compile {}\"\n", sh_quote(&out_name), sh_quote(f), sh_quote(f)));
             }
+            script.push_str("else\n");
+            script.push_str("    echo \"Warning: Windows Fortran compiler (x86_64-w64-mingw32-gfortran) not found, skipping Fortran compilation\"\n");
+            script.push_str("fi\n\n");
+        } else {
+            script.push_str("# Fortran\n");
+            script.push_str("if command -v gfortran &> /dev/null; then\n");
+            for f in files {
+                let out_name = format!("fortran_{}", f.replace(".f90", ".o"));
+                object_files.push(out_name.clone());
+                native_objects.push(out_name.clone());
+                script.push_str(&format!("    gfortran -fno-underscoring -O2 -c -fPIC -o {} {} 2>&1 || echo \"Warning: Failed to compile {}\"\n", sh_quote(&out_name), sh_quote(f), sh_quote(f)));
+            }
+            script.push_str("else\n");
+            script.push_str("    echo \"Warning: Fortran compiler (gfortran) not found, skipping Fortran compilation\"\n");
+            script.push_str("fi\n\n");
         }
     }
 
     // JVM languages - compile to JAR, then embed as C data segment
     // The JAR is embedded as binary data in the unified binary
     // The JVM runtime is NOT bundled - declared as a runtime dependency
-    if let Some(files) = files_by_lang.get("java") {
-        if !files.is_empty() {
-            script.push_str("# Java - compile to JAR, embed as C data segment\n");
-            script.push_str("# JVM is NOT bundled - declared as a runtime dependency\n");
-            script.push_str("if command -v javac &> /dev/null; then\n");
-            script.push_str("    mkdir -p classes\n");
-            script.push_str("    javac -d classes ");
-            for f in files {
-                script.push_str(&format!("{} ", sh_quote(f)));
-            }
-            script.push_str(&compile_failure_step(ffi_langs.contains("java"), "Java"));
-            script.push_str("    jar cf jgl_java.jar -C classes . 2>/dev/null || true\n");
-            script.push_str("else\n");
-            script.push_str(&missing_compiler_step(
-                ffi_langs.contains("java"),
-                "Java",
-                "javac",
-            ));
-            script.push_str("fi\n\n");
+    if let Some(files) = files_by_lang.get("java")
+        && !files.is_empty()
+    {
+        script.push_str("# Java - compile to JAR, embed as C data segment\n");
+        script.push_str("# JVM is NOT bundled - declared as a runtime dependency\n");
+        script.push_str("if command -v javac &> /dev/null; then\n");
+        script.push_str("    mkdir -p classes\n");
+        script.push_str("    javac -d classes ");
+        for f in files {
+            script.push_str(&format!("{} ", sh_quote(f)));
         }
+        script.push_str(&compile_failure_step(ffi_langs.contains("java"), "Java"));
+        script.push_str("    jar cf jgl_java.jar -C classes . 2>/dev/null || true\n");
+        script.push_str("else\n");
+        script.push_str(&missing_compiler_step(
+            ffi_langs.contains("java"),
+            "Java",
+            "javac",
+        ));
+        script.push_str("fi\n\n");
     }
 
     // Kotlin
-    if let Some(files) = files_by_lang.get("kt") {
-        if !files.is_empty() {
-            script.push_str("# Kotlin - compile to JAR, embed as C data segment\n");
-            script.push_str("# JVM is NOT bundled - declared as a runtime dependency\n");
-            script.push_str("if command -v kotlinc &> /dev/null; then\n");
-            script.push_str("    mkdir -p classes\n");
-            script.push_str("    kotlinc -d classes ");
-            for f in files {
-                script.push_str(&format!("{} ", sh_quote(f)));
-            }
-            script.push_str(&compile_failure_step(ffi_langs.contains("kt"), "Kotlin"));
-            script.push_str("    jar cf jgl_kotlin.jar -C classes . 2>/dev/null || true\n");
-            script.push_str("else\n");
-            script.push_str(&missing_compiler_step(
-                ffi_langs.contains("kt"),
-                "Kotlin",
-                "kotlinc",
-            ));
-            script.push_str("fi\n\n");
+    if let Some(files) = files_by_lang.get("kt")
+        && !files.is_empty()
+    {
+        script.push_str("# Kotlin - compile to JAR, embed as C data segment\n");
+        script.push_str("# JVM is NOT bundled - declared as a runtime dependency\n");
+        script.push_str("if command -v kotlinc &> /dev/null; then\n");
+        script.push_str("    mkdir -p classes\n");
+        script.push_str("    kotlinc -d classes ");
+        for f in files {
+            script.push_str(&format!("{} ", sh_quote(f)));
         }
+        script.push_str(&compile_failure_step(ffi_langs.contains("kt"), "Kotlin"));
+        script.push_str("    jar cf jgl_kotlin.jar -C classes . 2>/dev/null || true\n");
+        script.push_str("else\n");
+        script.push_str(&missing_compiler_step(
+            ffi_langs.contains("kt"),
+            "Kotlin",
+            "kotlinc",
+        ));
+        script.push_str("fi\n\n");
     }
 
     // Scala
-    if let Some(files) = files_by_lang.get("scala") {
-        if !files.is_empty() {
-            script.push_str("# Scala - compile to JAR, embed as C data segment\n");
-            script.push_str("# JVM is NOT bundled - declared as a runtime dependency\n");
-            script.push_str("if command -v scalac &> /dev/null; then\n");
-            script.push_str("    scalac ");
-            for f in files {
-                script.push_str(&format!("{} ", sh_quote(f)));
-            }
-            script.push_str(&format!(
-                "-d jgl_scala.jar {}",
-                compile_failure_step(ffi_langs.contains("scala"), "Scala")
-            ));
-            script.push_str("else\n");
-            script.push_str(&missing_compiler_step(
-                ffi_langs.contains("scala"),
-                "Scala",
-                "scalac",
-            ));
-            script.push_str("fi\n\n");
+    if let Some(files) = files_by_lang.get("scala")
+        && !files.is_empty()
+    {
+        script.push_str("# Scala - compile to JAR, embed as C data segment\n");
+        script.push_str("# JVM is NOT bundled - declared as a runtime dependency\n");
+        script.push_str("if command -v scalac &> /dev/null; then\n");
+        script.push_str("    scalac ");
+        for f in files {
+            script.push_str(&format!("{} ", sh_quote(f)));
         }
+        script.push_str(&format!(
+            "-d jgl_scala.jar {}",
+            compile_failure_step(ffi_langs.contains("scala"), "Scala")
+        ));
+        script.push_str("else\n");
+        script.push_str(&missing_compiler_step(
+            ffi_langs.contains("scala"),
+            "Scala",
+            "scalac",
+        ));
+        script.push_str("fi\n\n");
     }
 
     // C#
-    if let Some(files) = files_by_lang.get("cs") {
-        if !files.is_empty() {
-            script.push_str("# C# - compile to DLL, embed as C data segment\n");
-            script.push_str("# .NET runtime is NOT bundled - declared as a runtime dependency\n");
-            script.push_str("if command -v csc &> /dev/null; then\n");
-            script.push_str("    csc -target:library ");
-            for f in files {
-                script.push_str(&format!("{} ", sh_quote(f)));
-            }
-            script.push_str(&format!(
-                "-out:jgl_cs.dll {}",
-                compile_failure_step(ffi_langs.contains("cs"), "C#")
-            ));
-            script.push_str("elif command -v dotnet &> /dev/null; then\n");
-            script.push_str("    mkdir -p jgl_cs_proj\n");
-            for f in files {
-                script.push_str(&format!(
-                    "cp {} jgl_cs_proj/ 2>/dev/null || true\n",
-                    sh_quote(f)
-                ));
-            }
-            script.push_str("    cat > jgl_cs_proj/jgl_cs.csproj << 'CSPROJ_EOF'\n");
-            script.push_str("<Project Sdk=\"Microsoft.NET.Sdk\">\n");
-            script.push_str("  <PropertyGroup>\n");
-            script.push_str("    <TargetFramework>net10.0</TargetFramework>\n");
-            script.push_str("    <OutputType>Library</OutputType>\n");
-            script.push_str("    <AssemblyName>jgl_cs</AssemblyName>\n");
-            script.push_str("  </PropertyGroup>\n");
-            script.push_str("</Project>\n");
-            script.push_str("CSPROJ_EOF\n");
-            script.push_str(&format!(
-                "    dotnet build jgl_cs_proj -c Release {}",
-                compile_failure_step(ffi_langs.contains("cs"), "C#")
-            ));
-            script.push_str("    cp jgl_cs_proj/bin/Release/net10.0/jgl_cs.dll jgl_cs.dll 2>/dev/null || cp jgl_cs_proj/bin/Release/net6.0/jgl_cs.dll jgl_cs.dll 2>/dev/null || true\n");
-            script.push_str("else\n");
-            script.push_str(&missing_compiler_step(
-                ffi_langs.contains("cs"),
-                "C#",
-                "csc or dotnet",
-            ));
-            script.push_str("fi\n\n");
+    if let Some(files) = files_by_lang.get("cs")
+        && !files.is_empty()
+    {
+        script.push_str("# C# - compile to DLL, embed as C data segment\n");
+        script.push_str("# .NET runtime is NOT bundled - declared as a runtime dependency\n");
+        script.push_str("if command -v csc &> /dev/null; then\n");
+        script.push_str("    csc -target:library ");
+        for f in files {
+            script.push_str(&format!("{} ", sh_quote(f)));
         }
+        script.push_str(&format!(
+            "-out:jgl_cs.dll {}",
+            compile_failure_step(ffi_langs.contains("cs"), "C#")
+        ));
+        script.push_str("elif command -v dotnet &> /dev/null; then\n");
+        script.push_str("    mkdir -p jgl_cs_proj\n");
+        for f in files {
+            script.push_str(&format!(
+                "cp {} jgl_cs_proj/ 2>/dev/null || true\n",
+                sh_quote(f)
+            ));
+        }
+        script.push_str("    cat > jgl_cs_proj/jgl_cs.csproj << 'CSPROJ_EOF'\n");
+        script.push_str("<Project Sdk=\"Microsoft.NET.Sdk\">\n");
+        script.push_str("  <PropertyGroup>\n");
+        script.push_str("    <TargetFramework>net10.0</TargetFramework>\n");
+        script.push_str("    <OutputType>Library</OutputType>\n");
+        script.push_str("    <AssemblyName>jgl_cs</AssemblyName>\n");
+        script.push_str("  </PropertyGroup>\n");
+        script.push_str("</Project>\n");
+        script.push_str("CSPROJ_EOF\n");
+        script.push_str(&format!(
+            "    dotnet build jgl_cs_proj -c Release {}",
+            compile_failure_step(ffi_langs.contains("cs"), "C#")
+        ));
+        script.push_str("    cp jgl_cs_proj/bin/Release/net10.0/jgl_cs.dll jgl_cs.dll 2>/dev/null || cp jgl_cs_proj/bin/Release/net6.0/jgl_cs.dll jgl_cs.dll 2>/dev/null || true\n");
+        script.push_str("else\n");
+        script.push_str(&missing_compiler_step(
+            ffi_langs.contains("cs"),
+            "C#",
+            "csc or dotnet",
+        ));
+        script.push_str("fi\n\n");
     }
 
     // Precompile TypeScript to JavaScript for faster runtime execution
@@ -750,11 +753,12 @@ pub fn generate_build_sh(
             .push_str("            # Create C wrapper with the file content as a string literal\n");
         script.push_str("            echo \"#include <stdint.h>\" > \"embed_${var_name}.c\"\n");
         script.push_str("            echo \"const char ${var_name}_name[] = \\\"$script_file\\\";\" >> \"embed_${var_name}.c\"\n");
-        script.push_str("            printf \"const unsigned char ${var_name}_data[] = { \" >> \"embed_${var_name}.c\"\n");
+        script
+            .push_str("            printf \"const unsigned char ${var_name}_data[] __attribute__((section(\\\".rodata\\\"), visibility(\\\"hidden\\\"))) = { \" >> \"embed_${var_name}.c\"\n");
         script.push_str("            od -An -v -tx1 \"$script_file\" | tr -d ' \\n' | sed 's/../0x&,/g; s/,$//' >> \"embed_${var_name}.c\"\n");
         script.push_str("            echo \" };\" >> \"embed_${var_name}.c\"\n");
         script.push_str("            printf \"const uint32_t ${var_name}_len = %d;\" $(wc -c < \"$script_file\") >> \"embed_${var_name}.c\"\n");
-        script.push_str("            $SCRIPT_CC -c -O2 -o \"$obj_name\" \"embed_${var_name}.c\" 2>/dev/null || echo \"Warning: Failed to embed $script_file\"\n");
+        script.push_str("            $SCRIPT_CC -c -O0 -o \"$obj_name\" \"embed_${var_name}.c\" 2>/dev/null || echo \"Warning: Failed to embed $script_file\"\n");
         script.push_str("            if [ -f \"$obj_name\" ]; then\n");
         script.push_str("                NATIVE_OBJECTS=\"$NATIVE_OBJECTS $obj_name\"\n");
         script.push_str("            fi\n");
@@ -777,15 +781,16 @@ pub fn generate_build_sh(
     // compilation steps, so that a name conflict is reported before
     // anything is built.
     // The tag the bridges write in front of the value they return. It
-    // carries a nonce that is different in every build, and it travels
-    // through the environment, so that a target cannot read it from its
-    // own command line.
+    // carries a nonce that is different in every build, and it is written
+    // into the bridge itself: the file the value travels through has no
+    // name at all, and the environment of the target is left alone.
     let marker = result_marker();
     // The token that makes the paths of this build unique. The paths the
     // generated C writes to are compile time constants, so two projects
     // that are built at the same time would write over each other
-    // without it.
-    let token = build_token();
+    // without it. The token is minted while the build script is written,
+    // so two runs of the generator get two sets of paths.
+    let token = generate_token();
     let has_java = files_by_lang.contains_key("java");
     let has_kotlin = files_by_lang.contains_key("kt");
     let has_scala = files_by_lang.contains_key("scala");
@@ -838,7 +843,7 @@ pub fn generate_build_sh(
                 &mut script,
                 "JglJavaBridge.java",
                 "JAVA_BRIDGE",
-                &jvm_bridge_source(&jvm_classes),
+                &jvm_bridge_source(&jvm_classes, &marker),
                 "        ",
             );
             script.push_str("        javac -d classes JglJavaBridge.java 2>/dev/null || true\n");
@@ -854,7 +859,7 @@ pub fn generate_build_sh(
                 &jvm_c_stub_source(&jvm_classes, &token, &marker),
                 "        ",
             );
-            script.push_str("        $SCRIPT_CC -c -O2 -o ffi_jgl_java.o ffi_jgl_java.c 2>&1 || echo \"Warning: Failed to compile Java FFI bridge\"\n");
+            script.push_str("        $SCRIPT_CC -c -O1 -o ffi_jgl_java.o ffi_jgl_java.c 2>&1 || echo \"Warning: Failed to compile Java FFI bridge\"\n");
             script.push_str("        if [ -f ffi_jgl_java.o ]; then\n");
             script.push_str("            NATIVE_OBJECTS=\"$NATIVE_OBJECTS ffi_jgl_java.o\"\n");
             script.push_str("        fi\n");
@@ -885,7 +890,7 @@ pub fn generate_build_sh(
                 &mut script,
                 "jgl_cs_runner/JglCsBridge.cs",
                 "CS_BRIDGE",
-                &cs_bridge_source(&cs_classes),
+                &cs_bridge_source(&cs_classes, &marker),
                 "        ",
             );
             script.push_str("        if command -v csc &> /dev/null; then\n");
@@ -927,7 +932,7 @@ pub fn generate_build_sh(
                 &cs_c_stub_source(&cs_classes, &token, &marker),
                 "        ",
             );
-            script.push_str("        $SCRIPT_CC -c -O2 -o ffi_jgl_cs.o ffi_jgl_cs.c 2>&1 || echo \"Warning: Failed to compile C# FFI bridge\"\n");
+            script.push_str("        $SCRIPT_CC -c -O1 -o ffi_jgl_cs.o ffi_jgl_cs.c 2>&1 || echo \"Warning: Failed to compile C# FFI bridge\"\n");
             script.push_str("        if [ -f ffi_jgl_cs.o ]; then\n");
             script.push_str("            NATIVE_OBJECTS=\"$NATIVE_OBJECTS ffi_jgl_cs.o\"\n");
             script.push_str("        fi\n");
@@ -939,7 +944,8 @@ pub fn generate_build_sh(
     // FFI bridges for embedded scripting languages (Python, Lua, TypeScript,
     // JavaScript). These languages run in a subprocess — the embedded source
     // is written to a temp file at runtime, the interpreter is invoked with
-    // the input as an argument, and the result is read from stdout.
+    // the input as an argument, and the result is read back from the file
+    // the call handed to the interpreter.
     if has_py {
         let py_methods: Vec<&FfiMethod> = exposed.iter().filter(|m| m.lang == "py").collect();
         // Every Python file of the project is written into the directory the
@@ -968,7 +974,7 @@ pub fn generate_build_sh(
                 &py_c_stub_source(&py_methods, &token, &py_files, &marker),
                 "    ",
             );
-            script.push_str("    $SCRIPT_CC -c -O2 -o ffi_jgl_python.o ffi_jgl_python.c 2>&1 || echo \"Warning: Failed to compile Python FFI bridge\"\n");
+            script.push_str("    $SCRIPT_CC -c -O1 -o ffi_jgl_python.o ffi_jgl_python.c 2>&1 || echo \"Warning: Failed to compile Python FFI bridge\"\n");
             script.push_str("    if [ -f ffi_jgl_python.o ]; then\n");
             script.push_str("        NATIVE_OBJECTS=\"$NATIVE_OBJECTS ffi_jgl_python.o\"\n");
             script.push_str("    fi\n");
@@ -999,7 +1005,7 @@ pub fn generate_build_sh(
                 &lua_c_stub_source(&lua_methods, &token, &marker),
                 "    ",
             );
-            script.push_str("    $SCRIPT_CC -c -O2 -o ffi_jgl_lua.o ffi_jgl_lua.c 2>&1 || echo \"Warning: Failed to compile Lua FFI bridge\"\n");
+            script.push_str("    $SCRIPT_CC -c -O1 -o ffi_jgl_lua.o ffi_jgl_lua.c 2>&1 || echo \"Warning: Failed to compile Lua FFI bridge\"\n");
             script.push_str("    if [ -f ffi_jgl_lua.o ]; then\n");
             script.push_str("        NATIVE_OBJECTS=\"$NATIVE_OBJECTS ffi_jgl_lua.o\"\n");
             script.push_str("    fi\n");
@@ -1031,7 +1037,7 @@ pub fn generate_build_sh(
                 &node_c_stub_source("ts", &ts_methods, &token, &marker),
                 "    ",
             );
-            script.push_str("    $SCRIPT_CC -c -O2 -o ffi_jgl_ts.o ffi_jgl_ts.c 2>&1 || echo \"Warning: Failed to compile TS FFI bridge\"\n");
+            script.push_str("    $SCRIPT_CC -c -O1 -o ffi_jgl_ts.o ffi_jgl_ts.c 2>&1 || echo \"Warning: Failed to compile TS FFI bridge\"\n");
             script.push_str("    if [ -f ffi_jgl_ts.o ]; then\n");
             script.push_str("        NATIVE_OBJECTS=\"$NATIVE_OBJECTS ffi_jgl_ts.o\"\n");
             script.push_str("    fi\n");
@@ -1064,7 +1070,7 @@ pub fn generate_build_sh(
                 &node_c_stub_source("js", &js_methods, &token, &marker),
                 "    ",
             );
-            script.push_str("    $SCRIPT_CC -c -O2 -o ffi_jgl_js.o ffi_jgl_js.c 2>&1 || echo \"Warning: Failed to compile JS FFI bridge\"\n");
+            script.push_str("    $SCRIPT_CC -c -O1 -o ffi_jgl_js.o ffi_jgl_js.c 2>&1 || echo \"Warning: Failed to compile JS FFI bridge\"\n");
             script.push_str("    if [ -f ffi_jgl_js.o ]; then\n");
             script.push_str("        NATIVE_OBJECTS=\"$NATIVE_OBJECTS ffi_jgl_js.o\"\n");
             script.push_str("    fi\n");
@@ -1095,7 +1101,7 @@ pub fn generate_build_sh(
                     cmd, custom.extension
                 ));
             }
-            script.push_str("\n");
+            script.push('\n');
         }
     }
     // Embed binary payloads (JARs, DLLs) as C data segments
@@ -1118,11 +1124,11 @@ pub fn generate_build_sh(
     script.push_str("            echo \"Embedding $jar_file as C data...\"\n");
     script.push_str("            echo \"#include <stdint.h>\" > \"embed_${var_name}.c\"\n");
     script.push_str("            echo \"const char ${var_name}_name[] = \\\"$jar_file\\\";\" >> \"embed_${var_name}.c\"\n");
-    script.push_str("            printf \"const unsigned char ${var_name}_data[] = { \" >> \"embed_${var_name}.c\"\n");
+    script.push_str("            printf \"const unsigned char ${var_name}_data[] __attribute__((section(\\\".rodata\\\"), visibility(\\\"hidden\\\"))) = { \" >> \"embed_${var_name}.c\"\n");
     script.push_str("            od -An -v -tx1 \"$jar_file\" | tr -d ' \\n' | sed 's/../0x&,/g; s/,$//' >> \"embed_${var_name}.c\"\n");
     script.push_str("            echo \" };\" >> \"embed_${var_name}.c\"\n");
     script.push_str("            printf \"const uint32_t ${var_name}_len = %d;\" $(wc -c < \"$jar_file\") >> \"embed_${var_name}.c\"\n");
-    script.push_str("            $SCRIPT_CC -c -O2 -o \"$obj_name\" \"embed_${var_name}.c\" 2>/dev/null || echo \"Warning: Failed to embed $jar_file\"\n");
+    script.push_str("            $SCRIPT_CC -c -O0 -o \"$obj_name\" \"embed_${var_name}.c\" 2>/dev/null || echo \"Warning: Failed to embed $jar_file\"\n");
     script.push_str("            if [ -f \"$obj_name\" ]; then\n");
     script.push_str("                NATIVE_OBJECTS=\"$NATIVE_OBJECTS $obj_name\"\n");
     script.push_str("            fi\n");
@@ -1138,7 +1144,7 @@ pub fn generate_build_sh(
     let has_rust = files_by_lang.contains_key("rs");
     // Determine if Rust is the main linker (has its own main entry point)
     let rust_is_main = has_rust
-        && files_by_lang.get("rs").map_or(false, |rust_files| {
+        && files_by_lang.get("rs").is_some_and(|rust_files| {
             rust_files
                 .iter()
                 .any(|rf| rf.contains("main") || rf.ends_with("main.rs"))
@@ -1282,7 +1288,7 @@ pub fn generate_build_sh(
         bin_name_final, bin_name_final
     ));
     script.push_str("    cd .. && rm -rf jgl_build && echo \"Cleaned up jgl_build/\"\n");
-    script.push_str(&format!("    echo \"Compilation complete.\"\n"));
+    script.push_str("    echo \"Compilation complete.\"\n");
     script.push_str("else\n");
     script.push_str(&format!(
         "    echo \"Warning: {} not found in jgl_build/\"\n",
@@ -1291,17 +1297,17 @@ pub fn generate_build_sh(
     script.push_str("fi\n");
 
     let build_sh_path = output_dir.join("build.sh");
-    std::fs::write(&build_sh_path, script).map_err(|e| JglcError::Io(e))?;
+    std::fs::write(&build_sh_path, script).map_err(JglcError::Io)?;
 
     // Make executable
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mut perms = std::fs::metadata(&build_sh_path)
-            .map_err(|e| JglcError::Io(e))?
+            .map_err(JglcError::Io)?
             .permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&build_sh_path, perms).map_err(|e| JglcError::Io(e))?;
+        std::fs::set_permissions(&build_sh_path, perms).map_err(JglcError::Io)?;
     }
 
     Ok(())
@@ -1750,10 +1756,17 @@ fn assign_c_symbols(methods: &mut [FfiMethod]) {
     // of method keeps the numbered symbols. The class holds the last
     // definition and the earlier one is out of reach, so the name of the
     // class stands for more than one method, and the symbol says so.
-    let mut kinds: HashMap<(String, String, &'static str), usize> = HashMap::new();
-    let mut ambiguous: HashSet<(String, String, &'static str)> = HashSet::new();
-    for m in methods.iter().filter(|m| m.lang == "py") {
+    //
+    // Only the methods that are exposed are counted, and the file is part
+    // of the identity of the class: a method that is not exposed has no
+    // prototype and no stub, so it must not push the name of an exposed
+    // method out of the way, and two classes of the same name in two files
+    // are two classes.
+    let mut kinds: HashMap<(String, String, String, &'static str), usize> = HashMap::new();
+    let mut ambiguous: HashSet<(String, String, String, &'static str)> = HashSet::new();
+    for m in methods.iter().filter(|m| m.lang == "py" && m.is_exposed()) {
         let key = (
+            m.file.clone(),
             m.class_name.clone().unwrap_or_default(),
             m.sig.name.clone(),
             m.py_kind,
@@ -1769,6 +1782,7 @@ fn assign_c_symbols(methods: &mut [FfiMethod]) {
         let name = c_function_name(&m.sig.name);
         let ambiguous_name = m.lang == "py"
             && ambiguous.contains(&(
+                m.file.clone(),
                 m.class_name.clone().unwrap_or_default(),
                 m.sig.name.clone(),
                 m.py_kind,
@@ -2052,7 +2066,7 @@ fn emit_libc_conflict_check(script: &mut String, methods: &[FfiMethod], target_w
     }
     script.push_str("fi\n");
     script.push_str("rm -f \"$JGL_HDR_PROBE\" \"$JGL_HDR_ONE\"\n");
-    script.push_str("\n");
+    script.push('\n');
 }
 
 /// Render the header that declares the FFI methods to the user's own C code.
@@ -2598,17 +2612,28 @@ fn py_call_args(m: &MethodSig) -> (Vec<String>, Vec<(String, String)>) {
     let mut keyword: Vec<(String, String)> = Vec::new();
     for (i, p) in m.params.iter().enumerate() {
         let idx = i + 1;
-        let value = match p.jgl_type {
-            JglType::Double => format!(
-                "struct.unpack('>d', struct.pack('>Q', int(sys.argv[{}], 16)))[0]",
-                idx
-            ),
-            JglType::Int => format!("int(sys.argv[{}])", idx),
-            JglType::String => format!("sys.argv[{}]", idx),
-            JglType::Bool => {
-                format!("sys.argv[{}] in (\"1\", \"true\", \"True\")", idx)
+        let value = if p.rest {
+            // A parameter that collects the rest of the arguments holds a
+            // list of the type it declares.
+            py_list_expr(p, idx)
+        } else {
+            match p.jgl_type {
+                JglType::Double => format!(
+                    "struct.unpack('>d', struct.pack('>Q', int(sys.argv[{}], 16)))[0]",
+                    idx
+                ),
+                JglType::Int => format!("int(sys.argv[{}])", idx),
+                JglType::String => format!("sys.argv[{}]", idx),
+                JglType::Bool => {
+                    format!("sys.argv[{}] in (\"1\", \"true\", \"True\")", idx)
+                }
+                // A collection travels as its comma separated text, the
+                // same way it travels to every other language.
+                JglType::Array => py_list_expr(p, idx),
+                // An object has no comma separated form, so it travels as
+                // its JSON text.
+                JglType::Object => format!("json.loads(sys.argv[{}])", idx),
             }
-            JglType::Array | JglType::Object => format!("json.loads(sys.argv[{}])", idx),
         };
         // A parameter that can only be passed by keyword is handed its
         // value by name.
@@ -2621,12 +2646,35 @@ fn py_call_args(m: &MethodSig) -> (Vec<String>, Vec<(String, String)>) {
     (positional, keyword)
 }
 
+/// The expression that turns the comma separated text of an argument into
+/// the list a collection parameter holds.
+fn py_list_expr(p: &Param, idx: usize) -> String {
+    let list = format!(
+        "(sys.argv[{}] if sys.argv[{}] else \"\").split(\",\")",
+        idx, idx
+    );
+    match collection_element_converter(p) {
+        Some(f) => format!("[{}(_jgl_x) for _jgl_x in {}]", f, list),
+        None => format!("list({})", list),
+    }
+}
+
 /// The expression that calls a Python method.
 fn py_call_expr(m: &FfiMethod, positional_count: usize, has_keyword: bool) -> String {
     // The arguments are read before the module runs, so the call refers to
     // the values that were read then.
+    let positional: Vec<&Param> = m.sig.params.iter().filter(|p| !p.keyword_only).collect();
     let mut parts: Vec<String> = (0..positional_count)
-        .map(|i| format!("_jgl_args[{}]", i))
+        .map(|i| {
+            // A parameter that collects the rest of the arguments takes the
+            // elements one by one, so the list is spread into the call.
+            let rest = positional.get(i).map(|p| p.rest).unwrap_or(false);
+            if rest {
+                format!("*_jgl_args[{}]", i)
+            } else {
+                format!("_jgl_args[{}]", i)
+            }
+        })
         .collect();
     if has_keyword {
         parts.push("**_jgl_kwargs".to_string());
@@ -2702,22 +2750,19 @@ fn py_program(
     positional: &[String],
     keyword: &[(String, String)],
     registry: bool,
+    marker: &str,
 ) -> String {
     let mut program = String::new();
     program.push_str(prelude);
     program.push('\n');
-    program.push_str("_jgl_print = __import__(\"builtins\").print\n");
     program.push_str("_jgl_str = __import__(\"builtins\").str\n");
     program.push_str("_jgl_int = __import__(\"builtins\").int\n");
+    program.push_str("_jgl_float = __import__(\"builtins\").float\n");
+    program.push_str("_jgl_len = __import__(\"builtins\").len\n");
+    program.push_str("_jgl_bytes_of = __import__(\"builtins\").bytes\n");
     program.push_str("_jgl_getattr = __import__(\"builtins\").getattr\n");
-    program.push_str("_jgl_open = __import__(\"builtins\").open\n");
     program.push_str("_jgl_RuntimeError = __import__(\"builtins\").RuntimeError\n");
-    // The file the result is written to and the tag that frames the value.
-    // They are taken out of the environment, so that the module cannot see
-    // them there and the result never travels through the command line of
-    // the target.
-    program.push_str("_jgl_res = os.environ.pop(\"JGL_RESULT_FILE\", \"\")\n");
-    program.push_str("_jgl_tag = os.environ.pop(\"JGL_RESULT_TAG\", \"\")\n");
+    program.push_str("_jgl_pwrite = os.pwrite\n");
     // A single argument needs a comma of its own, so that the list is a
     // tuple and not the value itself.
     let args = if positional.len() == 1 {
@@ -2740,25 +2785,70 @@ fn py_program(
     }
     // The module is not the main program: the block a module guards with
     // "if __name__ == \"__main__\"" belongs to the program and not to the
-    // module, and it must not run on every call.
-    program.push_str("_jgl_name = globals().get(\"__name__\", \"\")\n");
+    // module, and it must not run on every call. The name stays the name of
+    // the module for the rest of the call, so that a guard inside a
+    // function body sees it as well.
     program.push_str("globals()[\"__name__\"] = \"jgl_module\"\n");
     program.push_str(&format!("exec(open(\"{}\").read())\n", temp));
-    program.push_str("globals()[\"__name__\"] = _jgl_name\n");
-    // The value is written to the file the stub reads it from.
+    // The value is written into the file of the call, on the descriptor 3.
+    // The builtins the bridge uses are taken before the module runs, so that
+    // a module with a builtin of its own cannot take them away.
     match value {
         Some(expr) => {
             program.push_str(&format!("_jgl_value = {}\n", expr));
-            program.push_str("_jgl_f = _jgl_open(_jgl_res, \"w\")\n");
-            program.push_str("_jgl_f.write(_jgl_tag + _jgl_str(_jgl_value))\n");
+            program.push_str("_jgl_payload = _jgl_str(_jgl_value).encode(\"utf-8\")\n");
         }
         None => {
-            program.push_str("_jgl_f = _jgl_open(_jgl_res, \"w\")\n");
-            program.push_str("_jgl_f.write(_jgl_tag)\n");
+            program.push_str("_jgl_payload = b\"\"\n");
         }
     }
-    program.push_str("_jgl_f.close()\n");
+    program.push_str("_jgl_n = _jgl_len(_jgl_payload)\n");
+    program.push_str(&format!(
+        "_jgl_head = b\"{}\" + _jgl_bytes_of([(_jgl_n >> 24) & 255, (_jgl_n >> 16) & 255, (_jgl_n >> 8) & 255, _jgl_n & 255])\n",
+        marker
+    ));
+    program.push_str("_jgl_pwrite(3, _jgl_head + _jgl_payload, 0)\n");
     program
+}
+
+/// The type of the elements of a collection parameter.
+///
+/// A collection travels as its comma separated text, and its elements are
+/// turned into the type the parameter declares.
+fn collection_element_type(p: &Param) -> Option<String> {
+    let raw = p.raw_type.trim();
+    if let Some(e) = raw.strip_suffix("[]") {
+        return Some(e.trim().to_string());
+    }
+    if let Some(e) = raw.strip_suffix("...") {
+        return Some(e.trim().to_string());
+    }
+    // "list[int]" names the type of its elements.
+    if let Some(open) = raw.find('[')
+        && let Some(close) = raw.rfind(']')
+        && close > open + 1
+    {
+        return Some(raw[open + 1..close].trim().to_string());
+    }
+    // A parameter that collects the rest of the arguments holds a list of
+    // the type it declares.
+    if p.rest {
+        return Some(raw.to_string());
+    }
+    None
+}
+
+/// The function that turns an element of a collection into its type, when
+/// the elements are numbers.
+fn collection_element_converter(p: &Param) -> Option<&'static str> {
+    match collection_element_type(p) {
+        Some(t) => match JglType::parse(&t) {
+            JglType::Int => Some("_jgl_int"),
+            JglType::Double => Some("_jgl_float"),
+            _ => None,
+        },
+        None => None,
+    }
 }
 
 /// TypeScript/Node call-argument expression list.
@@ -2776,15 +2866,30 @@ fn build_ts_args(m: &MethodSig) -> String {
                     idx, idx
                 ),
                 JglType::String => format!("process.argv[{}]", idx),
-                JglType::Array | JglType::Object => {
-                    if p.rest && p.jgl_type == JglType::Array {
+                JglType::Array => {
+                    // A collection travels as its comma separated text, the
+                    // same way it travels to every other language.
+                    let mut list = format!(
+                        "(process.argv[{}] ? process.argv[{}].split(\",\") : [])",
+                        idx, idx
+                    );
+                    if matches!(
+                        collection_element_type(p).map(|t| JglType::parse(&t)),
+                        Some(JglType::Double) | Some(JglType::Int)
+                    ) {
+                        list.push_str(".map(Number)");
+                    }
+                    if p.rest {
                         // A rest parameter collects the values of the
                         // array, so they are spread into the call.
-                        format!("...JSON.parse(process.argv[{}])", idx)
+                        format!("...{}", list)
                     } else {
-                        format!("JSON.parse(process.argv[{}])", idx)
+                        list
                     }
                 }
+                // An object has no comma separated form, so it travels as
+                // its JSON text.
+                JglType::Object => format!("JSON.parse(process.argv[{}])", idx),
             }
         })
         .collect::<Vec<_>>()
@@ -2827,7 +2932,7 @@ fn push_heredoc(script: &mut String, path: &str, delimiter: &str, content: &str,
 /// Preamble of the generated FFI C bridge files.
 fn c_bridge_preamble(comment: &str) -> String {
     format!(
-        "/* {} */\n#define _GNU_SOURCE\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <stdint.h>\n#include <unistd.h>\n#include <sys/stat.h>\n#include <sys/wait.h>\n\n",
+        "/* {} */\n#define _GNU_SOURCE\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <stdint.h>\n#include <errno.h>\n#include <fcntl.h>\n#include <unistd.h>\n#include <spawn.h>\n#include <sys/stat.h>\n#include <sys/wait.h>\n\n",
         comment
     )
 }
@@ -2879,14 +2984,16 @@ const PROG_CAP: usize = 65536;
 /// The capacity of the argument list buffer of a stub.
 const ARGLIST_CAP: usize = 65536;
 
-/// The prefix of the tag the bridge writes in front of the value it
+/// The prefix of the frame the bridge writes in front of the value it
 /// returns.
 ///
-/// The result is read from the file the bridge writes it to, and the tag
-/// frames the value in it, so that a file the target wrote itself holds no
-/// value at all. The tag carries a nonce that is different in every build,
-/// and it travels through the environment, so that a target cannot read it
-/// from its own command line.
+/// The result is read from the file the bridge writes it to, and the frame
+/// holds the value: the tag of the build and the length of the value. A
+/// file that does not carry the frame was not written by the bridge, so it
+/// holds no value at all. The tag carries a nonce that is different in
+/// every build, and it is written into the bridge itself: the file the
+/// value travels through has no name at all, and the environment of the
+/// target is left alone.
 const RESULT_MARKER_PREFIX: &str = "__JGL_R__";
 
 /// The tag of this build: the prefix and a nonce that is different in
@@ -2900,18 +3007,19 @@ fn result_marker() -> String {
 ///
 /// The paths the generated C writes to are compile time constants, so two
 /// projects that are built at the same time would write over each other.
-/// The token is different in every build, so the paths of two builds never
-/// meet.
-fn build_token() -> String {
+/// The token is different in every run of the generator, so the paths of
+/// two builds never meet.
+fn generate_token() -> String {
     result_nonce()
 }
 
 /// The nonce of the marker: sixteen hexadecimal digits that are different
 /// in every build.
 ///
-/// The nonce keeps a target from putting the marker into its own output.
-/// It is made of characters that need no quoting, so that it survives the
-/// shell and the languages the bridge runs in unchanged.
+/// The nonce tells one build from another: the frame of a build is the
+/// frame of that build only. It is made of characters that need no
+/// quoting, so that it survives the shell and the languages the bridge runs
+/// in unchanged.
 fn result_nonce() -> String {
     let mut bytes = [0u8; 8];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
@@ -2935,11 +3043,7 @@ fn result_nonce() -> String {
 /// The buffers that were allocated before the failure are released, so
 /// that a stub that is called many times does not grow without bound.
 fn c_bail(ret_c: &str, frees: &str) -> String {
-    format!(
-        "    if (p) {{ pclose(p); }}\n{}{}\n",
-        frees,
-        bail_return(ret_c)
-    )
+    format!("{}{}\n", frees, bail_return(ret_c))
 }
 
 /// The statement that leaves a stub with a value of the given C type.
@@ -2983,8 +3087,151 @@ fn c_return_decl(ret_c: &str) -> String {
     }
 }
 
+/// The helpers every stub of a bridge shares.
+///
+/// The scaffolding of a call is the same in every stub of a bridge, so it
+/// is written once and the stubs call it. A bridge of a project with many
+/// methods is therefore as long as the methods need and not as long as the
+/// methods are.
+fn c_bridge_helpers(marker: &str, runtime: &str) -> String {
+    let mut out = String::new();
+    out.push_str("/* The tag of this build: the frame of the result carries it. */\n");
+    out.push_str(&format!(
+        "static const char jgl_tag[] = \"{}\";\n",
+        c_escape(marker)
+    ));
+    out.push_str("/* The runtime the bridge runs. */\n");
+    out.push_str(&format!(
+        "static const char jgl_runtime[] = \"{}\";\n",
+        c_escape(runtime)
+    ));
+    out.push_str("/* Write a payload into a file and put it in its place with a rename.\n");
+    out.push_str("   The file is written under a name of its own and renamed into place, so\n");
+    out.push_str("   that a reader never sees half of it: two calls that run at the same\n");
+    out.push_str("   time cannot tear the file of the other one. A file that is already\n");
+    out.push_str("   there is left alone: the payload of a build never changes. */\n");
+    out.push_str("static int jgl_write_payload(const char *path, const unsigned char *data, uint32_t len) {\n");
+    out.push_str("    char jgl_tmp[512];\n");
+    out.push_str("    struct stat jgl_st;\n");
+    out.push_str("    if (stat(path, &jgl_st) == 0 && jgl_st.st_size == (off_t)len) return 0;\n");
+    out.push_str("    snprintf(jgl_tmp, sizeof jgl_tmp, \"%s.tmp.XXXXXX\", path);\n");
+    out.push_str("    int jgl_tf = mkstemp(jgl_tmp);\n");
+    out.push_str("    if (jgl_tf < 0) return -1;\n");
+    out.push_str("    FILE *tf = fdopen(jgl_tf, \"wb\");\n");
+    out.push_str("    if (!tf) { close(jgl_tf); return -1; }\n");
+    out.push_str("    fwrite(data, 1, len, tf);\n");
+    out.push_str("    fclose(tf);\n");
+    out.push_str("    rename(jgl_tmp, path);\n");
+    out.push_str("    return 0;\n");
+    out.push_str("}\n");
+    out.push_str(&c_call_helper(marker));
+    out
+}
+
+/// The helper that runs the command of a call and reads the result back.
+///
+/// The result travels through a channel of its own: the bridge writes the
+/// value into a file and the helper reads it back from there. The file is
+/// handed to the bridge as the file descriptor 3, so that neither its name
+/// nor the tag that frames the value ever travels through the command line
+/// or the environment of the target, and the output of the target is never
+/// part of the result.
+///
+/// Every call has a file of its own, so two calls that run at the same time
+/// never see each other's value, and the environment of the caller is left
+/// alone.
+fn c_call_helper(marker: &str) -> String {
+    let tag = marker.len();
+    let mut out = String::new();
+    out.push_str("/* Run the command of a call and read the result back.\n");
+    out.push_str("   The value is handed back in *value and *valuelen, and the status of\n");
+    out.push_str("   the subprocess is the return value. */\n");
+    out.push_str("static int jgl_call(const char *cmd, char **value, size_t *valuelen) {\n");
+    out.push_str("    char jgl_res_path[64];\n");
+    out.push_str("    strcpy(jgl_res_path, \"/tmp/_jgl_res_XXXXXX\");\n");
+    out.push_str("    int jgl_res_fd = mkstemp(jgl_res_path);\n");
+    out.push_str("    if (jgl_res_fd < 0) { *value = NULL; *valuelen = 0; return -1; }\n");
+    out.push_str("    unlink(jgl_res_path);\n");
+    out.push_str("    int jgl_res_file = fcntl(jgl_res_fd, F_DUPFD_CLOEXEC, 10);\n");
+    out.push_str("    if (jgl_res_file < 0) { close(jgl_res_fd); *value = NULL; *valuelen = 0; return -1; }\n");
+    out.push_str("    close(jgl_res_fd);\n");
+    out.push_str("    posix_spawn_file_actions_t jgl_actions;\n");
+    out.push_str("    posix_spawn_file_actions_init(&jgl_actions);\n");
+    out.push_str("    posix_spawn_file_actions_adddup2(&jgl_actions, jgl_res_file, 3);\n");
+    out.push_str("    posix_spawn_file_actions_addclose(&jgl_actions, jgl_res_file);\n");
+    out.push_str(
+        "    posix_spawn_file_actions_addopen(&jgl_actions, 1, \"/dev/null\", O_WRONLY, 0);\n",
+    );
+    out.push_str("    pid_t jgl_pid = -1;\n");
+    out.push_str("    char *jgl_argv[] = { \"sh\", \"-c\", (char *)cmd, NULL };\n");
+    out.push_str("    int jgl_spawn = posix_spawn(&jgl_pid, \"/bin/sh\", &jgl_actions, NULL, jgl_argv, environ);\n");
+    out.push_str("    posix_spawn_file_actions_destroy(&jgl_actions);\n");
+    out.push_str("    if (jgl_spawn != 0) {\n");
+    out.push_str("        fprintf(stderr, \"JglBridge: the runtime %s could not be started\\n\", jgl_runtime);\n");
+    out.push_str("        close(jgl_res_file);\n");
+    out.push_str("        *value = NULL; *valuelen = 0;\n");
+    out.push_str("        return -1;\n");
+    out.push_str("    }\n");
+    out.push_str("    int jgl_status = 0;\n");
+    out.push_str("    if (jgl_pid > 0) { waitpid(jgl_pid, &jgl_status, 0); }\n");
+    out.push_str("    lseek(jgl_res_file, 0, SEEK_SET);\n");
+    out.push_str("    char *jgl_res = NULL;\n");
+    out.push_str("    size_t jgl_reslen = 0;\n");
+    out.push_str("    size_t jgl_rescap = 4096;\n");
+    out.push_str("    jgl_res = (char *)malloc(jgl_rescap);\n");
+    out.push_str("    if (jgl_res) {\n");
+    out.push_str("        for (;;) {\n");
+    out.push_str("            if (jgl_reslen + 1 >= jgl_rescap) {\n");
+    out.push_str("                size_t ncap = jgl_rescap * 2;\n");
+    out.push_str("                char *grown = (char *)realloc(jgl_res, ncap);\n");
+    out.push_str("                if (!grown) { free(jgl_res); jgl_res = NULL; break; }\n");
+    out.push_str("                jgl_res = grown;\n");
+    out.push_str("                jgl_rescap = ncap;\n");
+    out.push_str("            }\n");
+    out.push_str("            ssize_t got = read(jgl_res_file, jgl_res + jgl_reslen, jgl_rescap - jgl_reslen - 1);\n");
+    out.push_str("            if (got < 0) { if (errno == EINTR) continue; break; }\n");
+    out.push_str("            jgl_reslen += (size_t)got;\n");
+    out.push_str("            if (got == 0) break;\n");
+    out.push_str("        }\n");
+    out.push_str("        if (jgl_res) jgl_res[jgl_reslen] = '\\0';\n");
+    out.push_str("    }\n");
+    out.push_str("    close(jgl_res_file);\n");
+    out.push_str("    char *jgl_out = NULL;\n");
+    out.push_str("    size_t jgl_outlen = 0;\n");
+    out.push_str(&format!(
+        "    if (jgl_res && jgl_reslen >= {} && memcmp(jgl_res, jgl_tag, {}) == 0) {{\n",
+        tag + 4,
+        tag
+    ));
+    out.push_str(&format!(
+        "        unsigned long jgl_n = ((unsigned long)(unsigned char)jgl_res[{t}] << 24) | ((unsigned long)(unsigned char)jgl_res[{t1}] << 16) | ((unsigned long)(unsigned char)jgl_res[{t2}] << 8) | (unsigned long)(unsigned char)jgl_res[{t3}];\n",
+        t = tag,
+        t1 = tag + 1,
+        t2 = tag + 2,
+        t3 = tag + 3
+    ));
+    out.push_str(&format!(
+        "        if (jgl_n <= jgl_reslen - {}) {{\n",
+        tag + 4
+    ));
+    out.push_str("            jgl_out = (char *)malloc((size_t)jgl_n + 1);\n");
+    out.push_str(&format!(
+        "            if (jgl_out) {{ memcpy(jgl_out, jgl_res + {}, (size_t)jgl_n); jgl_out[jgl_n] = '\\0'; }}\n",
+        tag + 4
+    ));
+    out.push_str("            jgl_outlen = (size_t)jgl_n;\n");
+    out.push_str("        }\n");
+    out.push_str("    }\n");
+    out.push_str("    free(jgl_res);\n");
+    out.push_str("    *value = jgl_out;\n");
+    out.push_str("    *valuelen = jgl_outlen;\n");
+    out.push_str("    return jgl_status;\n");
+    out.push_str("}\n");
+    out
+}
+
 /// Body of a subprocess-backed C stub: write the payload, run the runtime
-/// and read the result back from stdout.
+/// and read the result back from the file of the call.
 ///
 /// `cmd` holds the words of the command line: the literal ones, the ones
 /// that are only known at run time and the argument list.
@@ -2995,7 +3242,6 @@ fn c_stub_body(
     preamble: &str,
     program: Option<Program<'_>>,
     cmd: &CmdLine,
-    marker: &str,
 ) -> String {
     let param_decl = if params.trim().is_empty() {
         "void".to_string()
@@ -3031,9 +3277,8 @@ fn c_stub_body(
         name,
         param_decl
     ));
-    // The pipe is declared up front, so that the early exits below can
-    // close it.
-    out.push_str("    FILE *p = NULL;\n");
+    // The preamble sets the buffers of the arguments up and writes the
+    // payload the bridge needs.
     out.push_str(preamble);
     if let Some(p) = &program {
         // The buffers the argument expressions write into are allocated
@@ -3106,56 +3351,13 @@ fn c_stub_body(
     if cmd.arglist {
         out.push_str("    jgl_app(&cmd, &cmdcap, arglist, 0);\n");
     }
-    // The result travels through a channel of its own: the bridge writes
-    // the value to a file and the stub reads it back from there. The name
-    // of the file and the tag that frames the value are handed to the
-    // bridge through the environment, so that neither of them travels
-    // through the command line of the target, and the output of the
-    // target is never part of the result.
-    out.push_str("    char jgl_res_path[64];\n");
-    out.push_str("    strcpy(jgl_res_path, \"/tmp/_jgl_res_XXXXXX\");\n");
-    out.push_str("    int jgl_res_fd = mkstemp(jgl_res_path);\n");
-    out.push_str(&format!(
-        "    if (jgl_res_fd < 0) {{\n{}    }}\n",
-        c_bail(ret_c, &cmd_frees)
-    ));
-    out.push_str("    close(jgl_res_fd);\n");
-    out.push_str("    setenv(\"JGL_RESULT_FILE\", jgl_res_path, 1);\n");
-    out.push_str(&format!(
-        "    setenv(\"JGL_RESULT_TAG\", \"{}\", 1);\n",
-        c_escape(marker)
-    ));
-    out.push_str("    p = popen(cmd, \"r\");\n");
-    // A runtime that is not installed at all is reported: the call cannot
-    // go through, and the caller has to know why.
-    let runtime = cmd
-        .literals
-        .first()
-        .map(|(w, _)| w.clone())
-        .unwrap_or_else(|| "the runtime".to_string());
-    out.push_str("    if (!p) {\n");
-    out.push_str(&format!(
-        "        fprintf(stderr, \"JglBridge: the runtime {} could not be started\\n\");\n",
-        runtime
-    ));
-    out.push_str("        free(cmd);\n");
-    out.push_str("        remove(jgl_res_path);\n");
-    out.push_str("        unsetenv(\"JGL_RESULT_FILE\");\n");
-    out.push_str("        unsetenv(\"JGL_RESULT_TAG\");\n");
-    if has_program {
-        out.push_str("        free(prog);\n");
-    }
-    if cmd.arglist {
-        out.push_str("        free(arglist);\n");
-    }
-    if let Some(p) = &program {
-        if !p.cleanup.trim().is_empty() {
-            out.push_str(p.cleanup);
-        }
-    }
-    out.push_str(&format!("        {}\n", bail_return(ret_c)));
-    out.push_str("    }\n");
-    out.push_str(&c_result_reader(ret_c, &runtime, marker));
+    // The call itself. The scaffolding of a call is the same in every stub
+    // of a bridge, so it lives in a helper: the stub hands the command over
+    // and reads the value back.
+    out.push_str("    char *jgl_value = NULL;\n");
+    out.push_str("    size_t jgl_vallen = 0;\n");
+    out.push_str("    int jgl_status = jgl_call(cmd, &jgl_value, &jgl_vallen);\n");
+    out.push_str(&c_result_reader(ret_c));
     // The buffers are released before the result is handed back, so that a
     // stub that is called many times does not grow without bound.
     out.push_str("    free(cmd);\n");
@@ -3165,10 +3367,10 @@ fn c_stub_body(
     if cmd.arglist {
         out.push_str("    free(arglist);\n");
     }
-    if let Some(p) = &program {
-        if !p.cleanup.trim().is_empty() {
-            out.push_str(p.cleanup);
-        }
+    if let Some(p) = &program
+        && !p.cleanup.trim().is_empty()
+    {
+        out.push_str(p.cleanup);
     }
     if ret_c != "void" {
         out.push_str("    return result;\n");
@@ -3177,118 +3379,35 @@ fn c_stub_body(
     out
 }
 
-/// The code that reads the result of a subprocess back out of the file the
-/// bridge wrote it to. The result is left in a variable named "result".
+/// The code that reads the value of a call back and hands it to the caller.
 ///
 /// The result never travels through the output of the target: the bridge
-/// writes it to a file of its own, and the file is read here. The tag
-/// frames the value, so that a file the target wrote itself holds no value
-/// at all.
-fn c_result_reader(ret_c: &str, runtime: &str, tag: &str) -> String {
+/// writes it into the file of the call, and the helper of the call reads it
+/// back. The value is the value the method returned, byte for byte: a line
+/// break that belongs to it is part of it and is kept.
+fn c_result_reader(ret_c: &str) -> String {
     let mut out = String::new();
-    // The output of the subprocess is read whole and thrown away. It is the
-    // output of the target, and the result does not travel through it. The
-    // buffer grows, so that a target that prints a lot does not fill the
-    // pipe and block.
-    out.push_str("    char *jgl_out = NULL;\n");
-    out.push_str("    size_t jgl_outlen = 0;\n");
-    out.push_str("    size_t jgl_outcap = 4096;\n");
-    out.push_str("    int jgl_status = 0;\n");
-    out.push_str("    jgl_out = (char *)malloc(jgl_outcap);\n");
-    out.push_str("    if (jgl_out) {\n");
-    out.push_str("        for (;;) {\n");
-    out.push_str("            if (jgl_outlen + 1 >= jgl_outcap) {\n");
-    out.push_str("                size_t ncap = jgl_outcap * 2;\n");
-    out.push_str("                char *grown = (char *)realloc(jgl_out, ncap);\n");
-    out.push_str("                if (!grown) { free(jgl_out); jgl_out = NULL; break; }\n");
-    out.push_str("                jgl_out = grown;\n");
-    out.push_str("                jgl_outcap = ncap;\n");
-    out.push_str("            }\n");
-    out.push_str("            size_t got = fread(jgl_out + jgl_outlen, 1, jgl_outcap - jgl_outlen - 1, p);\n");
-    out.push_str("            jgl_outlen += got;\n");
-    out.push_str("            if (got == 0) break;\n");
-    out.push_str("        }\n");
-    out.push_str("        if (jgl_out) jgl_out[jgl_outlen] = '\\0';\n");
-    out.push_str("    }\n");
-    out.push_str("    jgl_status = pclose(p);\n");
-    out.push_str("    p = NULL;\n");
-    // The result is read from the file the bridge wrote it to.
-    out.push_str("    FILE *jgl_rf = fopen(jgl_res_path, \"rb\");\n");
-    out.push_str("    char *jgl_res = NULL;\n");
-    out.push_str("    size_t jgl_reslen = 0;\n");
-    out.push_str("    size_t jgl_rescap = 4096;\n");
-    out.push_str("    if (jgl_rf) {\n");
-    out.push_str("        jgl_res = (char *)malloc(jgl_rescap);\n");
-    out.push_str("        if (jgl_res) {\n");
-    out.push_str("            for (;;) {\n");
-    out.push_str("                if (jgl_reslen + 1 >= jgl_rescap) {\n");
-    out.push_str("                    size_t ncap = jgl_rescap * 2;\n");
-    out.push_str("                    char *grown = (char *)realloc(jgl_res, ncap);\n");
-    out.push_str("                    if (!grown) { free(jgl_res); jgl_res = NULL; break; }\n");
-    out.push_str("                    jgl_res = grown;\n");
-    out.push_str("                    jgl_rescap = ncap;\n");
-    out.push_str("                }\n");
-    out.push_str("                size_t got = fread(jgl_res + jgl_reslen, 1, jgl_rescap - jgl_reslen - 1, jgl_rf);\n");
-    out.push_str("                jgl_reslen += got;\n");
-    out.push_str("                if (got == 0) break;\n");
-    out.push_str("            }\n");
-    out.push_str("            if (jgl_res) jgl_res[jgl_reslen] = '\\0';\n");
-    out.push_str("        }\n");
-    out.push_str("        fclose(jgl_rf);\n");
-    out.push_str("    }\n");
-    // The file has served its purpose and the environment is clean again.
-    out.push_str("    remove(jgl_res_path);\n");
-    out.push_str("    unsetenv(\"JGL_RESULT_FILE\");\n");
-    out.push_str("    unsetenv(\"JGL_RESULT_TAG\");\n");
-    // The value is what follows the tag. A file that does not carry the tag
-    // was not written by the bridge, so it holds no value at all.
-    out.push_str("    const char *jgl_value = NULL;\n");
-    out.push_str(&format!(
-        "    if (jgl_res && jgl_reslen >= {} && memcmp(jgl_res, \"{}\", {}) == 0) {{ jgl_value = jgl_res + {}; }}\n",
-        tag.len(),
-        c_escape(tag),
-        tag.len(),
-        tag.len()
-    ));
     if ret_c == "char*" {
         // A text result is read whole, so that it may contain spaces, and it
         // may be of any length. The buffer is allocated per call, so that
         // two results held at the same time do not alias each other.
-        out.push_str("    char *result = (char *)malloc(jgl_reslen + 1);\n");
-        out.push_str("    if (!result) { free(jgl_res); free(jgl_out); return NULL; }\n");
-        out.push_str("    result[0] = '\\0';\n");
-        out.push_str("    if (jgl_value) {\n");
-        out.push_str("        size_t n = strlen(jgl_value);\n");
-        out.push_str("        memcpy(result, jgl_value, n + 1);\n");
-        out.push_str("        /* The bridge writes the value and one line break. That one line break belongs to the print, every other one is part of the value. */\n");
-        out.push_str("        if (n > 0 && result[n-1] == '\\n') { result[--n] = '\\0'; }\n");
-        out.push_str("    }\n");
-        out.push_str("    free(jgl_res);\n");
-        out.push_str("    free(jgl_out);\n");
-    } else if ret_c == "void" {
-        out.push_str("    free(jgl_res);\n");
-        out.push_str("    free(jgl_out);\n");
-    } else {
+        out.push_str("    char *result = (char *)malloc(jgl_vallen + 1);\n");
+        out.push_str("    if (!result) { free(jgl_value); return NULL; }\n");
+        out.push_str("    if (jgl_value) { memcpy(result, jgl_value, jgl_vallen); }\n");
+        out.push_str("    result[jgl_vallen] = '\\0';\n");
+    } else if ret_c != "void" {
         out.push_str(&format!("    {} result = 0;\n", ret_c));
         out.push_str(&format!(
             "    if (jgl_value && sscanf(jgl_value, \"%{}\", &result) != 1) {{ fprintf(stderr, \"JglBridge: the call returned a value that is not a number\\n\"); result = 0; }}\n",
             c_return_scanfmt(ret_c)
         ));
-        out.push_str("    free(jgl_res);\n");
-        out.push_str("    free(jgl_out);\n");
     }
     // The status of the subprocess says whether the call went through. A
     // call that failed is reported: the value it would have returned is
     // not a value at all.
     out.push_str("    if (jgl_status != 0) {\n");
-    out.push_str(&format!(
-        "        if (WIFEXITED(jgl_status)) fprintf(stderr, \"JglBridge: {} exited with status %d\\n\", WEXITSTATUS(jgl_status));\n",
-        runtime
-    ));
-    out.push_str(&format!(
-        "        else fprintf(stderr, \"JglBridge: {} was stopped by signal %d\\n\", WTERMSIG(jgl_status));\n",
-        runtime
-    ));
+    out.push_str("        if (WIFEXITED(jgl_status)) fprintf(stderr, \"JglBridge: %s exited with status %d\\n\", jgl_runtime, WEXITSTATUS(jgl_status));\n");
+    out.push_str("        else fprintf(stderr, \"JglBridge: %s was stopped by signal %d\\n\", jgl_runtime, WTERMSIG(jgl_status));\n");
     out.push_str("    }\n");
     if ret_c != "void" {
         out.push_str("    else if (!jgl_value) {\n");
@@ -3297,6 +3416,7 @@ fn c_result_reader(ret_c: &str, runtime: &str, tag: &str) -> String {
         );
         out.push_str("    }\n");
     }
+    out.push_str("    free(jgl_value);\n");
     out
 }
 
@@ -3462,21 +3582,38 @@ fn java_print_ret(kind: RetKind, method: &str) -> String {
     }
 }
 
-/// The Java helper that writes the result to the file the stub reads.
+/// The Java helper that writes the result into the file of the call.
 ///
-/// The file and the tag that frames the value come from the environment,
-/// so that neither of them travels through the command line of the target.
-fn java_result_helper() -> String {
+/// The file is the one the stub handed to the bridge as the descriptor 3,
+/// and the frame that holds the value is the tag of the build and the
+/// length of the value. The tag is written into the bridge itself: the file
+/// the value travels through has no name at all, and the environment of the
+/// target is left alone.
+fn java_result_helper(marker: &str) -> String {
     let mut out = String::new();
-    out.push_str("    private static String jglResPath;\n");
-    out.push_str("    private static String jglResTag;\n");
     out.push_str("    private static void jglWrite(String value) {\n");
-    out.push_str("        if (jglResPath == null) return;\n");
     out.push_str("        try {\n");
-    out.push_str("            java.io.PrintWriter w = new java.io.PrintWriter(new java.io.FileWriter(jglResPath));\n");
-    out.push_str("            w.print(jglResTag == null ? \"\" : jglResTag);\n");
-    out.push_str("            w.print(value == null ? \"\" : value);\n");
-    out.push_str("            w.close();\n");
+    out.push_str(
+        "            byte[] payload = (value == null ? \"\" : value).getBytes(\"UTF-8\");\n",
+    );
+    out.push_str(&format!(
+        "            byte[] magic = \"{}\".getBytes(\"UTF-8\");\n",
+        marker
+    ));
+    out.push_str(&format!(
+        "            byte[] head = new byte[{}];\n",
+        marker.len() + 4
+    ));
+    out.push_str("            System.arraycopy(magic, 0, head, 0, magic.length);\n");
+    out.push_str("            int n = payload.length;\n");
+    out.push_str("            head[magic.length] = (byte)((n >> 24) & 255);\n");
+    out.push_str("            head[magic.length + 1] = (byte)((n >> 16) & 255);\n");
+    out.push_str("            head[magic.length + 2] = (byte)((n >> 8) & 255);\n");
+    out.push_str("            head[magic.length + 3] = (byte)(n & 255);\n");
+    out.push_str("            java.io.FileOutputStream f = new java.io.FileOutputStream(\"/proc/self/fd/3\");\n");
+    out.push_str("            f.write(head);\n");
+    out.push_str("            f.write(payload);\n");
+    out.push_str("            f.close();\n");
     out.push_str("        } catch (Exception e) {\n");
     out.push_str("            System.err.println(\"JglJavaBridge: the result could not be written: \" + e.getMessage());\n");
     out.push_str("        }\n");
@@ -3581,17 +3718,15 @@ fn java_bridge_block(m: &FfiMethod) -> String {
 }
 
 /// Render the Java bridge source for the given classes.
-fn jvm_bridge_source(classes: &[JvmClass]) -> String {
+fn jvm_bridge_source(classes: &[JvmClass], marker: &str) -> String {
     let mut out = String::new();
     out.push_str("import java.lang.reflect.*;\n");
     out.push_str("public class JglJavaBridge {\n");
     out.push_str(&java_collection_helpers());
     out.push_str(&java_lookup_helper());
-    out.push_str(&java_result_helper());
+    out.push_str(&java_result_helper(marker));
     out.push_str("    public static void main(String[] args) {\n");
     out.push_str("        try {\n");
-    out.push_str("        jglResPath = System.getenv(\"JGL_RESULT_FILE\");\n");
-    out.push_str("        jglResTag = System.getenv(\"JGL_RESULT_TAG\");\n");
     out.push_str("        String className = args[0];\n");
     out.push_str("        String methodName = args[1];\n");
     out.push_str("        Class<?> cls = Class.forName(className);\n");
@@ -3632,6 +3767,7 @@ fn jvm_c_stub_source(classes: &[JvmClass], token: &str, marker: &str) -> String 
     if takes_double(classes.iter().flat_map(|c| c.methods.iter().copied())) {
         out.push_str(DOUBLE_BITS_HELPER);
     }
+    out.push_str(&c_bridge_helpers(marker, "java"));
     for c in classes {
         // The path of the jar carries the token of the build, so that two
         // projects that are built at the same time never write over each
@@ -3653,12 +3789,12 @@ fn jvm_c_stub_source(classes: &[JvmClass], token: &str, marker: &str) -> String 
                 continue;
             }
             let preamble = format!(
-                "    FILE *tf = fopen(\"{}\", \"wb\");\n    if (tf) {{ fwrite({}_data, 1, {}_len, tf); fclose(tf); }}\n{}{}",
-                jar_path,
-                c.jar_symbol,
-                c.jar_symbol,
+                "    if (jgl_write_payload(\"{jar}\", {sym}_data, {sym}_len) != 0) {{ {bail} }}\n{}{}",
                 cmd_arg_bufs(&args),
-                build_shell_arg_list(&args, &ret_c)
+                build_shell_arg_list(&args, &ret_c),
+                jar = c_escape(&jar_path),
+                sym = c.jar_symbol,
+                bail = bail_return(&ret_c),
             );
             let cmd = CmdLine {
                 literals: vec![
@@ -3672,9 +3808,7 @@ fn jvm_c_stub_source(classes: &[JvmClass], token: &str, marker: &str) -> String 
                 runtime: vec![],
                 arglist: !args.is_empty(),
             };
-            out.push_str(&c_stub_body(
-                &ret_c, &m.sym, &params, &preamble, None, &cmd, marker,
-            ));
+            out.push_str(&c_stub_body(&ret_c, &m.sym, &params, &preamble, None, &cmd));
             out.push('\n');
         }
     }
@@ -3794,24 +3928,47 @@ fn cs_print_ret(kind: RetKind, var: &str, method: &str) -> String {
             v = var
         ),
         RetKind::Float => format!(
-            "double d;\nif ({v} == null) {{ Console.Error.WriteLine(\"JglCsBridge: method {m} returned a value that is not a number\"); Environment.Exit(1); return; }}\ntry {{ d = Convert.ToDouble({v}, CultureInfo.InvariantCulture); }}\ncatch (Exception) {{ Console.Error.WriteLine(\"JglCsBridge: method {m} returned a value that is not a number\"); Environment.Exit(1); return; }}\nJlWrite(d.ToString(\"R\", CultureInfo.InvariantCulture));",
+            "double d;\nif ({v} == null) {{ Console.Error.WriteLine(\"JglCsBridge: method {m} returned null, which is not a number\"); Environment.Exit(1); return; }}\ntry {{ d = Convert.ToDouble({v}, CultureInfo.InvariantCulture); }}\ncatch (Exception) {{ Console.Error.WriteLine(\"JglCsBridge: method {m} returned a value that is not a number\"); Environment.Exit(1); return; }}\nJlWrite(d.ToString(\"R\", CultureInfo.InvariantCulture));",
             v = var,
             m = method
         ),
     }
 }
 
-/// The C# helper that writes the result to the file the stub reads.
+/// The C# helper that writes the result into the file of the call.
 ///
-/// The file and the tag that frames the value come from the environment,
-/// so that neither of them travels through the command line of the target.
-fn cs_result_helper() -> String {
+/// The file is the one the stub handed to the bridge as the descriptor 3,
+/// and the frame that holds the value is the tag of the build and the
+/// length of the value. The tag is written into the bridge itself: the file
+/// the value travels through has no name at all, and the environment of the
+/// target is left alone.
+fn cs_result_helper(marker: &str) -> String {
     let mut out = String::new();
-    out.push_str("    static string jglResPath;\n");
-    out.push_str("    static string jglResTag;\n");
     out.push_str("    static void JlWrite(string value) {\n");
-    out.push_str("        if (jglResPath == null) return;\n");
-    out.push_str("        try { System.IO.File.WriteAllText(jglResPath, (jglResTag ?? \"\") + (value ?? \"\")); }\n");
+    out.push_str("        try {\n");
+    out.push_str(
+        "            byte[] payload = System.Text.Encoding.UTF8.GetBytes(value ?? \"\");\n",
+    );
+    out.push_str(&format!(
+        "            byte[] magic = System.Text.Encoding.UTF8.GetBytes(\"{}\");\n",
+        marker
+    ));
+    out.push_str(&format!(
+        "            byte[] head = new byte[{}];\n",
+        marker.len() + 4
+    ));
+    out.push_str("            Array.Copy(magic, 0, head, 0, magic.Length);\n");
+    out.push_str("            int n = payload.Length;\n");
+    out.push_str("            head[magic.Length] = (byte)((n >> 24) & 255);\n");
+    out.push_str("            head[magic.Length + 1] = (byte)((n >> 16) & 255);\n");
+    out.push_str("            head[magic.Length + 2] = (byte)((n >> 8) & 255);\n");
+    out.push_str("            head[magic.Length + 3] = (byte)(n & 255);\n");
+    out.push_str("            using (var f = new System.IO.FileStream(\"/proc/self/fd/3\", System.IO.FileMode.Create, System.IO.FileAccess.Write)) {\n");
+    out.push_str("                f.Write(head, 0, head.Length);\n");
+    out.push_str("                f.Write(payload, 0, payload.Length);\n");
+    out.push_str("                f.Flush();\n");
+    out.push_str("            }\n");
+    out.push_str("        }\n");
     out.push_str("        catch (Exception e) { Console.Error.WriteLine(\"JglCsBridge: the result could not be written: \" + e.Message); }\n");
     out.push_str("    }\n");
     out
@@ -3942,7 +4099,7 @@ fn cs_bridge_block(m: &FfiMethod) -> String {
 }
 
 /// Render the C# bridge source for the given classes.
-fn cs_bridge_source(classes: &[(String, Vec<&FfiMethod>)]) -> String {
+fn cs_bridge_source(classes: &[(String, Vec<&FfiMethod>)], marker: &str) -> String {
     let mut out = String::new();
     out.push_str("using System;\n");
     out.push_str("using System.Linq;\n");
@@ -3953,15 +4110,9 @@ fn cs_bridge_source(classes: &[(String, Vec<&FfiMethod>)]) -> String {
     out.push_str(&cs_collection_helpers());
     out.push_str(&cs_lookup_helper());
     out.push_str(&cs_type_arguments_helper());
-    out.push_str(&cs_result_helper());
+    out.push_str(&cs_result_helper(marker));
     out.push_str("    public static void Main(string[] args) {\n");
     out.push_str("        try {\n");
-    out.push_str(
-        "            jglResPath = Environment.GetEnvironmentVariable(\"JGL_RESULT_FILE\");\n",
-    );
-    out.push_str(
-        "            jglResTag = Environment.GetEnvironmentVariable(\"JGL_RESULT_TAG\");\n",
-    );
     out.push_str("            string dllPath = args[0];\n");
     out.push_str("            string className = args[1];\n");
     out.push_str("            string methodName = args[2];\n");
@@ -4061,6 +4212,20 @@ fn cs_c_stub_source(classes: &[(String, Vec<&FfiMethod>)], token: &str, marker: 
     );
     out.push_str("extern const unsigned char jgl_cs_bridge_dll_data[]; extern const uint32_t jgl_cs_bridge_dll_len;\n");
     out.push_str("extern const unsigned char jgl_cs_bridge_runtimeconfig_json_data[]; extern const uint32_t jgl_cs_bridge_runtimeconfig_json_len;\n\n");
+    out.push_str(&c_bridge_helpers(marker, "dotnet"));
+    // The bridge and its configuration belong to the build, so they are
+    // written once and every call finds them.
+    out.push_str("static int jgl_payload(void) {\n");
+    out.push_str(&format!(
+        "    if (jgl_write_payload(\"{}\", jgl_cs_bridge_dll_data, jgl_cs_bridge_dll_len) != 0) return -1;\n",
+        c_escape(&format!("/tmp/_jgl_cs_bridge_{}.dll", token))
+    ));
+    out.push_str(&format!(
+        "    if (jgl_write_payload(\"{}\", jgl_cs_bridge_runtimeconfig_json_data, jgl_cs_bridge_runtimeconfig_json_len) != 0) return -1;\n",
+        c_escape(&format!("/tmp/_jgl_cs_bridge_{}.runtimeconfig.json", token))
+    ));
+    out.push_str("    return 0;\n");
+    out.push_str("}\n");
     for (class_name, methods) in classes {
         for m in methods {
             let ret_c = c_return_type_kind(ffi_ret_kind(m));
@@ -4078,17 +4243,15 @@ fn cs_c_stub_source(classes: &[(String, Vec<&FfiMethod>)], token: &str, marker: 
             // The path the stub writes the DLL to is the path the command
             // hands to the bridge.
             let dll_path = format!("/tmp/_jgl_cs_{}_{}.dll", token, m.sym);
-            // The bridge and its configuration keep the same stem, so that
-            // the runtime finds the configuration of the bridge.
+            // The bridge keeps the same stem, so that the runtime finds the
+            // configuration of the bridge.
             let bridge_dll = format!("/tmp/_jgl_cs_bridge_{}.dll", token);
-            let bridge_config = format!("/tmp/_jgl_cs_bridge_{}.runtimeconfig.json", token);
             let preamble = format!(
-                "    FILE *tf = fopen(\"{}\", \"wb\");\n    if (tf) {{ fwrite(jgl_cs_dll_data, 1, jgl_cs_dll_len, tf); fclose(tf); }}\n    FILE *bf = fopen(\"{}\", \"wb\");\n    if (bf) {{ fwrite(jgl_cs_bridge_dll_data, 1, jgl_cs_bridge_dll_len, bf); fclose(bf); }}\n    FILE *rf = fopen(\"{}\", \"w\");\n    if (rf) {{ fwrite(jgl_cs_bridge_runtimeconfig_json_data, 1, jgl_cs_bridge_runtimeconfig_json_len, rf); fclose(rf); }}\n{}{}",
-                dll_path,
-                bridge_dll,
-                bridge_config,
+                "    if (jgl_payload() != 0 || jgl_write_payload(\"{dll}\", jgl_cs_dll_data, jgl_cs_dll_len) != 0) {{ {bail} }}\n{}{}",
                 cmd_arg_bufs(&args),
-                build_shell_arg_list(&args, &ret_c)
+                build_shell_arg_list(&args, &ret_c),
+                dll = c_escape(&dll_path),
+                bail = bail_return(&ret_c),
             );
             let cmd = CmdLine {
                 literals: vec![
@@ -4101,9 +4264,7 @@ fn cs_c_stub_source(classes: &[(String, Vec<&FfiMethod>)], token: &str, marker: 
                 runtime: vec![],
                 arglist: !args.is_empty(),
             };
-            out.push_str(&c_stub_body(
-                &ret_c, &m.sym, &params, &preamble, None, &cmd, marker,
-            ));
+            out.push_str(&c_stub_body(&ret_c, &m.sym, &params, &preamble, None, &cmd));
             out.push('\n');
         }
     }
@@ -4143,16 +4304,25 @@ fn py_c_stub_source(methods: &[&FfiMethod], token: &str, files: &[String], marke
             sym, sym
         ));
     }
-    // The preamble every stub runs: it writes the files of the project into
-    // the directory they live in.
-    let mut files_preamble = format!("    FILE *tf = NULL;\n    mkdir(\"{}\", 0700);\n", dir);
+    out.push_str(&c_bridge_helpers(marker, "python3"));
+    // The files of the project are written into the directory they live in,
+    // and every file is put in its place with a rename, so that the
+    // interpreter never reads half a file and two calls that run at the
+    // same time cannot tear the file of the other one. The files belong to
+    // the build, so they are written once and every call finds them.
+    out.push_str("static int jgl_payload(void) {\n");
+    out.push_str(&format!("    mkdir(\"{}\", 0700);\n", c_escape(&dir)));
     for file in files {
         let sym = payload_symbol("py", file);
-        files_preamble.push_str(&format!(
-            "    tf = fopen(\"{}/{}\", \"w\");\n    if (tf) {{ fwrite({}_data, 1, {}_len, tf); fclose(tf); }}\n",
-            dir, file, sym, sym
+        out.push_str(&format!(
+            "    if (jgl_write_payload(\"{}\", {}_data, {}_len) != 0) return -1;\n",
+            c_escape(&format!("{}/{}", dir, file)),
+            sym,
+            sym
         ));
     }
+    out.push_str("    return 0;\n");
+    out.push_str("}\n");
     for file in source_files(methods) {
         for m in methods.iter().filter(|m| m.file == file) {
             let ret_c = c_return_type(&m.sig.return_type);
@@ -4225,13 +4395,28 @@ fn py_c_stub_source(methods: &[&FfiMethod], token: &str, files: &[String], marke
                     // is named after the module has run, so it cannot be
                     // part of the arguments that are read before.
                     let mut args: Vec<String> = Vec::new();
-                    if kind == "class" {
-                        if let Some(class) = &m.sig.qualifier {
-                            args.push(class.clone());
-                        }
+                    if kind == "class"
+                        && let Some(class) = &m.sig.qualifier
+                    {
+                        args.push(class.clone());
                     }
                     for i in 0..positional.len() {
-                        args.push(format!("_jgl_args[{}]", i));
+                        // A parameter that collects the rest of the
+                        // arguments takes the elements one by one, so the
+                        // list is spread into the call.
+                        let rest = m
+                            .sig
+                            .params
+                            .iter()
+                            .filter(|p| !p.keyword_only)
+                            .nth(i)
+                            .map(|p| p.rest)
+                            .unwrap_or(false);
+                        if rest {
+                            args.push(format!("*_jgl_args[{}]", i));
+                        } else {
+                            args.push(format!("_jgl_args[{}]", i));
+                        }
                     }
                     // A single argument needs a comma of its own, so that
                     // the list is a tuple and not the value itself.
@@ -4244,7 +4429,15 @@ fn py_c_stub_source(methods: &[&FfiMethod], token: &str, files: &[String], marke
                         "_jgl_call(\"{}\", \"{}\", {}, ({}), _jgl_kwargs)",
                         qualname, kind, m.kind_index, args
                     );
-                    py_program(&prelude, &temp, Some(&value), &positional, &keyword, true)
+                    py_program(
+                        &prelude,
+                        &temp,
+                        Some(&value),
+                        &positional,
+                        &keyword,
+                        true,
+                        marker,
+                    )
                 } else {
                     py_program(
                         &prelude,
@@ -4253,14 +4446,15 @@ fn py_c_stub_source(methods: &[&FfiMethod], token: &str, files: &[String], marke
                         &positional,
                         &keyword,
                         false,
+                        marker,
                     )
                 }
             };
             let preamble = format!(
-                "{}{}{}",
-                files_preamble,
+                "    if (jgl_payload() != 0) {{ {bail} }}\n{}{}",
                 cmd_arg_bufs(&args),
-                build_shell_arg_list(&args, &ret_c)
+                build_shell_arg_list(&args, &ret_c),
+                bail = bail_return(&ret_c),
             );
             let cmd = CmdLine {
                 literals: vec![("python3".to_string(), false), ("-c".to_string(), false)],
@@ -4284,7 +4478,6 @@ fn py_c_stub_source(methods: &[&FfiMethod], token: &str, files: &[String], marke
                     cleanup: "",
                 }),
                 &cmd,
-                marker,
             ));
             out.push('\n');
         }
@@ -4292,19 +4485,27 @@ fn py_c_stub_source(methods: &[&FfiMethod], token: &str, files: &[String], marke
     out
 }
 
-/// The Lua statements that write the result to the file the stub reads.
+/// The Lua statements that write the result into the file of the call.
 ///
-/// The file and the tag that frames the value come from the environment,
-/// so that neither of them travels through the command line of the target.
+/// The file is the one the stub handed to the bridge as the descriptor 3,
+/// and the frame that holds the value is the tag of the build and the
+/// length of the value. The tag is written into the bridge itself: the file
+/// the value travels through has no name at all, and the environment of the
+/// target is left alone.
+fn lua_result_helper(marker: &str) -> String {
+    format!(
+        "local __jgl_len = string.len local __jgl_char = string.char local __jgl_floor = math.floor local __jgl_open = io.open local function __jgl_write(s) local n = __jgl_len(s) local h = \"{marker}\" .. __jgl_char(__jgl_floor(n / 16777216) % 256, __jgl_floor(n / 65536) % 256, __jgl_floor(n / 256) % 256, n % 256) local f = __jgl_open(\"/proc/self/fd/3\", \"w\") if f then f:write(h, s) f:close() end end;",
+        marker = marker
+    )
+}
+
+/// The Lua call that writes the value the method returned.
 fn lua_result_write(value: Option<&str>) -> String {
     let text = match value {
-        Some(v) => format!("__jgl_tag .. {}", v),
-        None => "__jgl_tag".to_string(),
+        Some(v) => v.to_string(),
+        None => "\"\"".to_string(),
     };
-    format!(
-        "local __jgl_f = io.open(__jgl_res, \"w\"); if __jgl_f then __jgl_f:write({}); __jgl_f:close() end",
-        text
-    )
+    format!("__jgl_write({})", text)
 }
 
 /// Generate the C stubs calling into the embedded Lua sources.
@@ -4317,6 +4518,7 @@ fn lua_c_stub_source(methods: &[&FfiMethod], token: &str, marker: &str) -> Strin
     if takes_double(methods.iter().copied()) {
         out.push_str(DOUBLE_BITS_HELPER);
     }
+    out.push_str(&c_bridge_helpers(marker, "lua"));
     for file in source_files(methods) {
         let sym = payload_symbol("lua", &file);
         out.push_str(&format!(
@@ -4359,14 +4561,15 @@ fn lua_c_stub_source(methods: &[&FfiMethod], token: &str, marker: &str) -> Strin
             } else {
                 format!("fn({}, ", receiver)
             };
-            // The print of the bridge is taken before the module runs, so
-            // that a module with a print of its own cannot take it away.
-            // The file the result is written to and the tag that frames it
-            // come from the environment, so that neither of them travels
-            // through the command line of the target.
+            // The result is written into the file of the call, on the
+            // descriptor 3. The print of the bridge is taken before the
+            // module runs, so that a module with a print of its own cannot
+            // take it away.
             let head = format!(
-                "local __jgl_res = os.getenv(\"JGL_RESULT_FILE\") or \"\"; local __jgl_tag = os.getenv(\"JGL_RESULT_TAG\") or \"\"; local __jgl_print = print; local ok, res = pcall(dofile, \"{}\"); local mod = (type(res) == \"table\") and res or _G; local fn = {}; if fn == nil then error(\"function not found\") end;",
-                temp, lookup
+                "{helper}local ok, res = pcall(dofile, \"{temp}\"); if not ok then error(res) end; local mod = (type(res) == \"table\") and res or _G; local fn = {lookup}; if fn == nil then error(\"function not found\") end;",
+                helper = lua_result_helper(marker),
+                temp = temp,
+                lookup = lookup
             );
             let (prefix, suffix) = match ret_kind(&m.sig.return_type) {
                 // A void method still has to run, so the call is made and its
@@ -4411,11 +4614,11 @@ fn lua_c_stub_source(methods: &[&FfiMethod], token: &str, marker: &str) -> Strin
             // allocated before the program is built and released after it
             // has run.
             let preamble = format!(
-                "    FILE *tf = fopen(\"{}\", \"w\");\n    if (tf) {{ fwrite({}_data, 1, {}_len, tf); fclose(tf); }}\n{}",
-                temp,
-                sym,
-                sym,
-                cmd_arg_bufs(&lua_args)
+                "    if (jgl_write_payload(\"{path}\", {sym}_data, {sym}_len) != 0) {{ {bail} }}\n{}",
+                cmd_arg_bufs(&lua_args),
+                path = c_escape(&temp),
+                sym = sym,
+                bail = bail_return(&ret_c),
             );
             let cmd = CmdLine {
                 literals: vec![("lua".to_string(), false), ("-e".to_string(), false)],
@@ -4439,7 +4642,6 @@ fn lua_c_stub_source(methods: &[&FfiMethod], token: &str, marker: &str) -> Strin
                     cleanup: &call.cleanup,
                 }),
                 &cmd,
-                marker,
             ));
             out.push('\n');
         }
@@ -4456,6 +4658,7 @@ fn node_c_stub_source(lang: &str, methods: &[&FfiMethod], token: &str, marker: &
     if takes_double(methods.iter().copied()) {
         out.push_str(DOUBLE_BITS_HELPER);
     }
+    out.push_str(&c_bridge_helpers(marker, "node"));
     for file in source_files(methods) {
         let sym = payload_symbol(lang, &file);
         out.push_str(&format!(
@@ -4474,13 +4677,14 @@ fn node_c_stub_source(lang: &str, methods: &[&FfiMethod], token: &str, marker: &
                 RetKind::Bool => format!("const __jgl_value = Number({});", call),
                 _ => format!("const __jgl_value = ({});", call),
             };
-            // The value is written to the file the stub reads it from. The
-            // file and the tag that frames the value come from the
-            // environment, so that neither of them travels through the
-            // command line of the target.
+            // The value is written into the file of the call, on the
+            // descriptor 3. The frame that holds it is the tag of the build
+            // and the length of the value. The tag is written into the
+            // bridge itself: the file the value travels through has no name
+            // at all, and the environment of the target is left alone.
             let write = match ret_kind(&m.sig.return_type) {
-                RetKind::Void => "fs.writeFileSync(__jgl_res, __jgl_tag);".to_string(),
-                _ => "fs.writeFileSync(__jgl_res, __jgl_tag + String(__jgl_value));".to_string(),
+                RetKind::Void => "const __jgl_bytes = Buffer.alloc(0);".to_string(),
+                _ => "const __jgl_bytes = Buffer.from(String(__jgl_value), \"utf8\");".to_string(),
             };
             let temp = temp_script_path(lang, token, &m.sym);
             // A default export is published under the name "default", so the
@@ -4515,16 +4719,24 @@ fn node_c_stub_source(lang: &str, methods: &[&FfiMethod], token: &str, marker: &
                 ""
             };
             let program = format!(
-                "{}const fs = require(\"fs\"); const m = require(\"{}\"); const fn = {}; const __jgl_res = process.env.JGL_RESULT_FILE; const __jgl_tag = process.env.JGL_RESULT_TAG; {} {}",
-                helper, temp, lookup, stmt, write
+                "{}const fs = require(\"fs\"); const m = require(\"{}\"); const fn = {}; {} {} const __jgl_head = Buffer.alloc({}); Buffer.from(\"{}\", \"utf8\").copy(__jgl_head, 0); __jgl_head.writeUInt32BE(__jgl_bytes.length, {}); fs.writeSync(3, Buffer.concat([__jgl_head, __jgl_bytes]), 0, {} + __jgl_bytes.length, 0);",
+                helper,
+                temp,
+                lookup,
+                stmt,
+                write,
+                marker.len() + 4,
+                marker,
+                marker.len(),
+                marker.len() + 4
             );
             let preamble = format!(
-                "    FILE *tf = fopen(\"{}\", \"w\");\n    if (tf) {{ fwrite({}_data, 1, {}_len, tf); fclose(tf); }}\n{}{}",
-                temp,
-                sym,
-                sym,
+                "    if (jgl_write_payload(\"{path}\", {sym}_data, {sym}_len) != 0) {{ {bail} }}\n{}{}",
                 cmd_arg_bufs(&args),
-                build_shell_arg_list(&args, &ret_c)
+                build_shell_arg_list(&args, &ret_c),
+                path = c_escape(&temp),
+                sym = sym,
+                bail = bail_return(&ret_c),
             );
             let cmd = CmdLine {
                 literals: vec![("node".to_string(), false), ("-e".to_string(), false)],
@@ -4548,7 +4760,6 @@ fn node_c_stub_source(lang: &str, methods: &[&FfiMethod], token: &str, marker: &
                     cleanup: "",
                 }),
                 &cmd,
-                marker,
             ));
             out.push('\n');
         }
