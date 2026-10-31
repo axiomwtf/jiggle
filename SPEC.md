@@ -45,7 +45,7 @@ name._language {
 }
 ```
 
-Named blocks are extracted as `name.language` in the VFS. The underscore in `._language` is the naming sigil. Named blocks are referenceable by name in the manifest.
+Named blocks are extracted as `name.language` in the VFS. Block names take letters, digits, `_`, `-` and `.` (not starting with `.` or `-`); languages take letters, digits and `_`. Anything else, such as a `/` or `..`, is a compiler error. The underscore in `._language` is the naming sigil. Named blocks are referenceable by name in the manifest.
 
 ### 3.3 Manifest Block
 
@@ -61,7 +61,7 @@ project._jgl {
 ```
 
  **Manifest keywords:**
- - `name` — sets the output binary name (e.g. `name calc` produces `calc` instead of `jgl_binary`). Defaults to `jgl_binary` if not specified.
+ - `name` — sets the output binary name (e.g. `name calc` produces `calc` instead of `jgl_binary`). Defaults to `jgl_binary` if not specified. The name takes letters, digits, `_`, `-` and `.`, and cannot start with `.` or `-`.
  - `import` — import and merge another `.jgl` file
  - `target` — compile target (`cross`, `native`, or a specific triple such as `x86_64-unknown-linux-gnu`)
  - `dep[lang] { ... }` — declare dependencies for a language, see section 3.5

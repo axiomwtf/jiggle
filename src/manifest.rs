@@ -86,8 +86,14 @@ impl Manifest {
                 continue;
             }
             // Parse name (keyword followed by space)
-            if line.starts_with("name ") {
-                let name = line.strip_prefix("name").unwrap().trim();
+            if let Some(name) = line.strip_prefix("name ") {
+                let name = name.trim();
+                if !is_safe_name(name) {
+                    return Err(JglcError::Parse(format!(
+                        "Invalid project name '{}': use letters, digits, '_', '-' and '.', not starting with '.' or '-'",
+                        name
+                    )));
+                }
                 manifest.name = name.to_string();
                 i += 1;
                 continue;
@@ -97,6 +103,12 @@ impl Manifest {
             if let Some(ext) = line.strip_suffix("._sh {") {
                 let ext = ext.trim();
                 if !ext.is_empty() {
+                    if !is_safe_extension(ext) {
+                        return Err(JglcError::Parse(format!(
+                            "Invalid custom language extension '{}': use letters, digits and '_'",
+                            ext
+                        )));
+                    }
                     i += 1;
                     {
                         let custom_lang = parse_custom_language(&lines, &mut i, ext)?;
@@ -112,18 +124,13 @@ impl Manifest {
                 i += 1;
                 {
                     let entries = parse_dependency_block(&lines, &mut i)?;
-                    manifest.dependencies.insert(lang, entries);
+                    let existing = manifest.dependencies.entry(lang).or_default();
+                    merge_dependencies(existing, &entries)?;
                 }
                 continue;
             }
 
             i += 1;
-        }
-
-        // Validate custom languages have dep blocks
-        for _custom_lang in &manifest.custom_languages {
-            // Custom languages must have a dep.<file> block (which is parsed inside the _sh block)
-            // The parser already ensured this, but double check
         }
 
         Ok(manifest)
@@ -205,6 +212,12 @@ fn parse_custom_language(
                     .trim()
                     .to_string();
             }
+            if !is_safe_name(&dep_file) {
+                return Err(JglcError::Parse(format!(
+                    "Invalid dependency file name '{}' for custom language '{}'",
+                    dep_file, ext
+                )));
+            }
 
             *i += 1;
             // Parse the template (single line)
@@ -267,6 +280,12 @@ fn parse_dependency_block(
 
         // Parse: name = "version"
         if let Some((name, version)) = parse_dependency_entry(line) {
+            if !is_safe_dep_name(&name) || !is_safe_dep_version(&version) {
+                return Err(JglcError::Parse(format!(
+                    "Invalid dependency entry: {} (names take letters, digits and ._:/@+-; versions cannot hold quotes, backslashes, `, $, {{, }}, ; or control characters)",
+                    line
+                )));
+            }
             entries.push(DependencyEntry { name, version });
         } else {
             return Err(JglcError::Parse(format!(
@@ -284,7 +303,11 @@ fn parse_dependency_block(
 fn parse_dependency_entry(line: &str) -> Option<(String, String)> {
     // Format: name = "version"
     let eq_pos = line.find('=')?;
-    let name = line[..eq_pos].trim().to_string();
+    let name = line[..eq_pos]
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string();
     let version_part = line[eq_pos + 1..].trim();
     let version = version_part
         .trim_matches('"')
@@ -321,16 +344,25 @@ fn extract_dep_lang(line: &str) -> Result<String, JglcError> {
 /// Resolve imports and return additional blocks from imported files
 pub fn resolve_imports(
     manifest: &mut Manifest,
-    base_dir: &Path,
+    project_path: &Path,
 ) -> Result<Vec<crate::parser::Block>, JglcError> {
-    resolve_imports_inner(manifest, base_dir, &mut HashSet::new())
+    let base_dir = project_path.parent().unwrap_or(Path::new("."));
+    let root = project_path
+        .canonicalize()
+        .unwrap_or_else(|_| project_path.to_path_buf());
+    let mut stack = vec![root.clone()];
+    let mut done = HashSet::from([root]);
+    resolve_imports_inner(manifest, base_dir, &mut stack, &mut done)
 }
 
-/// Internal recursive implementation with cycle detection
+/// Depth-first import resolution. `stack` holds the files on the current
+/// import path (a repeat is a cycle); `done` holds every file already
+/// imported, so a file reached twice through different paths is read once.
 fn resolve_imports_inner(
     manifest: &mut Manifest,
     base_dir: &Path,
-    visited: &mut HashSet<PathBuf>,
+    stack: &mut Vec<PathBuf>,
+    done: &mut HashSet<PathBuf>,
 ) -> Result<Vec<crate::parser::Block>, JglcError> {
     let mut imported_blocks: Vec<crate::parser::Block> = Vec::new();
 
@@ -342,19 +374,15 @@ fn resolve_imports_inner(
         };
 
         let canonical = import_path.canonicalize().unwrap_or(import_path.clone());
-        if visited.contains(&canonical) {
+        if stack.contains(&canonical) {
             return Err(JglcError::Import(format!(
                 "Circular import detected: {}",
                 import_path.display()
             )));
         }
-        visited.insert(canonical.clone());
-
-        let import_path = if import.is_absolute() {
-            import.clone()
-        } else {
-            base_dir.join(import)
-        };
+        if !done.insert(canonical.clone()) {
+            continue;
+        }
 
         if !import_path.exists() {
             return Err(JglcError::Import(format!(
@@ -376,11 +404,14 @@ fn resolve_imports_inner(
         if let Some(imported_manifest) = imported.manifest {
             let mut sub_manifest = Manifest::parse(&imported_manifest)?;
             // Depth-first resolution: recursively resolve sub-imports
+            stack.push(canonical.clone());
             let sub_imports = resolve_imports_inner(
                 &mut sub_manifest,
                 import_path.parent().unwrap_or(base_dir),
-                visited,
+                stack,
+                done,
             )?;
+            stack.pop();
             imported_blocks.extend(sub_imports);
 
             // Merge dependencies
@@ -431,4 +462,90 @@ fn merge_dependencies(
 /// Check if a language can have dependencies
 pub fn language_supports_deps(lang: &str) -> bool {
     !matches!(lang, "sh" | "md" | "adoc" | "bs")
+}
+
+/// A name that is safe as a file name and as a word in `build.sh`: letters,
+/// digits, `_`, `-` and `.`, not starting with `.` or `-`.
+pub fn is_safe_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.starts_with('-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// A language extension: letters, digits and `_`.
+pub fn is_safe_extension(ext: &str) -> bool {
+    !ext.is_empty() && ext.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A dependency name every ecosystem file can hold without escaping, such as
+/// `serde`, `@types/node`, `org.slf4j:slf4j-api` or `github.com/x/y`.
+fn is_safe_dep_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && name.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':' | '/' | '@' | '+')
+        })
+}
+
+/// A version string that cannot break out of the quotes it is written in.
+fn is_safe_dep_version(version: &str) -> bool {
+    version
+        .chars()
+        .all(|c| !c.is_control() && !matches!(c, '"' | '\'' | '\\' | '`' | '$' | '{' | '}' | ';'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(body: &str) -> Result<Manifest, JglcError> {
+        let jgl = crate::parser::parse_jgl(&format!("project._jgl {{\n{}\n}}\n", body))?;
+        let block = jgl.manifest.ok_or(JglcError::Parse("no manifest".into()))?;
+        Manifest::parse(&block)
+    }
+
+    #[test]
+    fn rejects_unsafe_project_name() {
+        assert!(manifest("name calc").is_ok());
+        assert!(manifest("name x; touch /tmp/p").is_err());
+        assert!(manifest("name ../x").is_err());
+    }
+
+    #[test]
+    fn rejects_unsafe_dependency() {
+        assert!(manifest("dep[js] {\n\"@types/node\" = \"^20\"\n}").is_ok());
+        assert!(manifest("dep[js] {\n@types/node = \"^20\"\n}").is_ok());
+        assert!(manifest("dep[js] {\nx = \"1\\\", \\\"y\"\n}").is_err());
+    }
+
+    #[test]
+    fn merges_repeated_dep_blocks() {
+        let m = manifest("dep[rs] {\na = \"1\"\n}\ndep[rs] {\nb = \"2\"\n}").unwrap();
+        assert_eq!(m.dependencies["rs"].len(), 2);
+        assert!(manifest("dep[rs] {\na = \"1\"\n}\ndep[rs] {\na = \"2\"\n}").is_err());
+    }
+
+    #[test]
+    fn diamond_import_is_not_a_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, body: &str| std::fs::write(dir.path().join(name), body).unwrap();
+        write("shared.jgl", "project._jgl {\n}\nshared._c {\nint s;\n}\n");
+        write("b.jgl", "project._jgl {\nimport \"shared.jgl\"\n}\n");
+        write("c.jgl", "project._jgl {\nimport \"shared.jgl\"\n}\n");
+        write(
+            "project.jgl",
+            "project._jgl {\nimport \"b.jgl\"\nimport \"c.jgl\"\n}\n",
+        );
+        write("loop.jgl", "project._jgl {\nimport \"loop.jgl\"\n}\n");
+
+        let mut m = manifest("import \"b.jgl\"\nimport \"c.jgl\"").unwrap();
+        let blocks = resolve_imports(&mut m, &dir.path().join("project.jgl")).unwrap();
+        assert_eq!(blocks.len(), 1);
+
+        let mut m = manifest("import \"loop.jgl\"").unwrap();
+        assert!(resolve_imports(&mut m, &dir.path().join("project.jgl")).is_err());
+    }
 }
