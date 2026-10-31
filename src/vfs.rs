@@ -90,6 +90,14 @@ pub fn build_vfs(blocks: Vec<Block>, manifest: &Manifest) -> Result<Vfs, JglcErr
                 continue; // Non-project ._jgl blocks are discarded
             }
         } else if block.is_named {
+            if !crate::manifest::is_safe_name(&block.name)
+                || !crate::manifest::is_safe_extension(&block.language)
+            {
+                return Err(JglcError::BlockSyntax(format!(
+                    "'{}': block names take letters, digits, '_', '-' and '.' (not starting with '.' or '-'), languages take letters, digits and '_'",
+                    block.header
+                )));
+            }
             // Named block: name.extension
             format!("{}.{}", block.name, block.language)
         } else {

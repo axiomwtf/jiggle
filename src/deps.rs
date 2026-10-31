@@ -42,7 +42,9 @@ pub fn generate_dependency_files(
             .or_insert_with(|| lang.clone());
     }
     for (dep_filename, entries) in &files_by_output {
-        let lang = lang_per_output.get(dep_filename).unwrap();
+        let Some(lang) = lang_per_output.get(dep_filename) else {
+            continue;
+        };
         let dep_file_content = generate_dep_file(lang, entries, custom_languages)?;
 
         // Check for collision with existing VFS file
@@ -157,18 +159,7 @@ fn generate_cargo_toml(entries: &[DependencyEntry]) -> Result<String, JglcError>
     );
 
     for entry in entries {
-        if entry.version == "*" {
-            content.push_str(&format!("{} = \"*\"\n", entry.name));
-        } else if entry.version.starts_with('^')
-            || entry.version.starts_with('>')
-            || entry.version.starts_with('<')
-            || entry.version.starts_with('=')
-            || entry.version.starts_with('~')
-        {
-            content.push_str(&format!("{} = {}\n", entry.name, entry.version));
-        } else {
-            content.push_str(&format!("{} = \"{}\"\n", entry.name, entry.version));
-        }
+        content.push_str(&format!("{} = \"{}\"\n", entry.name, entry.version));
     }
 
     Ok(content)
@@ -274,7 +265,9 @@ fn generate_pom_xml(entries: &[DependencyEntry]) -> Result<String, JglcError> {
 
         content.push_str(&format!(
             "    <dependency>\n      <groupId>{}</groupId>\n      <artifactId>{}</artifactId>\n      <version>{}</version>\n    </dependency>\n",
-            group, artifact, entry.version
+            group,
+            artifact,
+            xml_escape(&entry.version)
         ));
     }
 
@@ -288,7 +281,8 @@ fn generate_packages_config(entries: &[DependencyEntry]) -> Result<String, JglcE
     for entry in entries {
         content.push_str(&format!(
             "  <package id=\"{}\" version=\"{}\" targetFramework=\"native\" />\n",
-            entry.name, entry.version
+            entry.name,
+            xml_escape(&entry.version)
         ));
     }
 
@@ -304,7 +298,7 @@ fn generate_gemfile(entries: &[DependencyEntry]) -> Result<String, JglcError> {
         if entry.version == "*" {
             content.push_str(&format!("gem '{}'\n", entry.name));
         } else {
-            content.push_str(&format!("gem '{}', {}\n", entry.name, entry.version));
+            content.push_str(&format!("gem '{}', '{}'\n", entry.name, entry.version));
         }
     }
 
@@ -320,7 +314,12 @@ fn generate_composer_json(entries: &[DependencyEntry]) -> Result<String, JglcErr
             content.push_str(",\n");
         }
         first = false;
-        content.push_str(&format!("    \"{}\": \"^{}\"", entry.name, entry.version));
+        let version = if entry.version == "*" {
+            entry.version.clone()
+        } else {
+            format!("^{}", entry.version.trim_start_matches('^'))
+        };
+        content.push_str(&format!("    \"{}\": \"{}\"", entry.name, version));
     }
 
     content.push_str("\n  }\n}\n");
@@ -404,4 +403,13 @@ fn generate_fpm_toml(entries: &[DependencyEntry]) -> Result<String, JglcError> {
     }
 
     Ok(content)
+}
+
+/// Escape the characters XML gives a meaning to. Names never hold them;
+/// versions may (for example `<2.0`).
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }

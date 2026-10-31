@@ -1,6 +1,5 @@
 use crate::error::JglcError;
 use crate::vfs::Vfs;
-use std::io::Write;
 use std::path::Path;
 use tar::{Builder, Header};
 use xz2::write::XzEncoder;
@@ -45,14 +44,5 @@ pub fn create_bundle(vfs: &Vfs, output_path: &Path) -> Result<(), JglcError> {
         .map_err(|e| JglcError::Tar(e.to_string()))?;
     w.finish().map_err(|e| JglcError::Xz(e.to_string()))?;
 
-    Ok(())
-}
-
-/// Write the manifest block to the bundle as project._jgl
-pub fn write_manifest_bundle(manifest_content: &str, output_dir: &Path) -> Result<(), JglcError> {
-    let manifest_path = output_dir.join("project._jgl");
-    let mut file = std::fs::File::create(&manifest_path).map_err(JglcError::Io)?;
-    file.write_all(manifest_content.as_bytes())
-        .map_err(JglcError::Io)?;
     Ok(())
 }

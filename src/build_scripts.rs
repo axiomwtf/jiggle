@@ -196,9 +196,6 @@ pub fn generate_build_sh(
             "",
         );
         script.push('\n');
-        // The header is kept next to the binary right away, so that a build
-        // that fails later still shows the prototypes of the methods.
-        script.push_str("cp jgl_ffi.h ../jgl_ffi.h 2>/dev/null || true\n");
     }
 
     // Collect all .o files for final linking
@@ -702,15 +699,17 @@ pub fn generate_build_sh(
     if !ts_files.is_empty() {
         script.push_str("# Precompile TypeScript to JavaScript for faster runtime\n");
         script.push_str("# Prefer bun for speed, fall back to npx tsc\n");
+        script.push_str("JGL_TS_OUT=$(mktemp -d)\n");
         script.push_str("for tsf in *.ts; do\n");
         script.push_str("    [ -f \"$tsf\" ] || continue\n");
         script.push_str("    js_out=\"${tsf%.ts}.jgl.js\"\n");
         script.push_str("    if command -v bun &> /dev/null; then\n");
-        script.push_str("        bun build \"$tsf\" --outdir /tmp/ts_out --format cjs 2>/dev/null && cp /tmp/ts_out/$(basename \"${tsf%.ts}\").js \"$js_out\" 2>/dev/null || true\n");
+        script.push_str("        bun build \"$tsf\" --outdir \"$JGL_TS_OUT\" --format cjs 2>/dev/null && cp \"$JGL_TS_OUT\"/$(basename \"${tsf%.ts}\").js \"$js_out\" 2>/dev/null || true\n");
         script.push_str("    elif command -v npx &> /dev/null; then\n");
-        script.push_str("        npx --yes tsc --module commonjs --target es2020 --outDir /tmp/ts_out \"$tsf\" 2>/dev/null && cp /tmp/ts_out/$(basename \"$tsf\" .ts).js \"$js_out\" 2>/dev/null || true\n");
+        script.push_str("        npx --yes tsc --module commonjs --target es2020 --outDir \"$JGL_TS_OUT\" \"$tsf\" 2>/dev/null && cp \"$JGL_TS_OUT\"/$(basename \"$tsf\" .ts).js \"$js_out\" 2>/dev/null || true\n");
         script.push_str("    fi\n");
-        script.push_str("done\n\n");
+        script.push_str("done\n");
+        script.push_str("rm -rf \"$JGL_TS_OUT\"\n\n");
     }
 
     // Scripting languages and binary payloads - embed as C string data for unified binary
@@ -1269,13 +1268,6 @@ pub fn generate_build_sh(
     }
     if has_ts {
         script.push_str("echo \"TypeScript: requires node at runtime (interpreter not bundled, TS precompiled to JS)\"\n");
-    }
-    // The header is kept next to the binary, so that the user can include it
-    // from a source of their own.
-    if !exposed.is_empty() {
-        script.push_str(
-            "if [ -f jgl_ffi.h ]; then cp jgl_ffi.h ../jgl_ffi.h 2>/dev/null || true; fi\n",
-        );
     }
     let bin_name_final = if target_win {
         format!("{}.exe", bin_name)
@@ -1995,7 +1987,7 @@ fn emit_libc_conflict_check(script: &mut String, methods: &[FfiMethod], target_w
     // The exported symbols are written to a file: a shell variable holding
     // thousands of names is unwieldy, and the file can be searched with
     // grep, which needs no quoting games.
-    script.push_str("JGL_LIBC_SYMS_FILE=$(mktemp 2>/dev/null || echo /tmp/_jgl_libc_syms.$$)\n");
+    script.push_str("JGL_LIBC_SYMS_FILE=$(mktemp)\n");
     script.push_str(": > \"$JGL_LIBC_SYMS_FILE\"\n");
     script.push_str("if command -v nm &> /dev/null && [ -n \"$JGL_TARGET_CC\" ]; then\n");
     // The library is found through the target's own compiler, so the path
@@ -2039,9 +2031,7 @@ fn emit_libc_conflict_check(script: &mut String, methods: &[FfiMethod], target_w
     // The probe file has to be read as C source: mktemp names it without an
     // extension, and the compiler would take it for a linker input and skip
     // the check.
-    script.push_str(
-        "JGL_HDR_PROBE=$(mktemp --suffix=.c 2>/dev/null || echo /tmp/_jgl_hdr_probe.$$.c)\n",
-    );
+    script.push_str("JGL_HDR_PROBE=$(mktemp --suffix=.c)\n");
     script.push_str("cat > \"$JGL_HDR_PROBE\" << 'JGL_HDR_EOF'\n");
     script.push_str("#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <strings.h>\n#include <math.h>\n#include <time.h>\n#include <ctype.h>\n#include <errno.h>\n#include <signal.h>\n#include <setjmp.h>\n#include <locale.h>\n#include <wchar.h>\n#include <unistd.h>\n");
     script.push_str("JGL_HDR_EOF\n");
@@ -2055,8 +2045,7 @@ fn emit_libc_conflict_check(script: &mut String, methods: &[FfiMethod], target_w
             sym
         ));
     }
-    script
-        .push_str("JGL_HDR_ONE=$(mktemp --suffix=.c 2>/dev/null || echo /tmp/_jgl_hdr_one.$$.c)\n");
+    script.push_str("JGL_HDR_ONE=$(mktemp --suffix=.c)\n");
     script.push_str("if [ -n \"$JGL_CC\" ] && ! $JGL_CC -x c -fsyntax-only \"$JGL_HDR_PROBE\" 2>/dev/null; then\n");
     for (sym, name, file) in &syms {
         script.push_str(&format!(
@@ -2219,7 +2208,16 @@ fn temp_script_path(lang: &str, token: &str, method: &str) -> String {
         "lua" => "lua",
         _ => "js",
     };
-    format!("/tmp/_jgl_{}_{}_{}.{}", token, lang, method, ext)
+    format!("{}/{}_{}.{}", private_dir(token), lang, method, ext)
+}
+
+/// The directory every payload of a build is written to at runtime.
+///
+/// The binary creates it with mode 0700 and refuses to run a payload from
+/// it unless it is a directory owned by the user that runs the binary, so
+/// no other user of the machine can plant a payload in it.
+fn private_dir(token: &str) -> String {
+    format!("/tmp/_jgl_{}", token)
 }
 
 /// The directory the Python sources of a project are written to at runtime.
@@ -2228,7 +2226,7 @@ fn temp_script_path(lang: &str, token: &str, method: &str) -> String {
 /// of the project can import one another, the way they do when the
 /// interpreter runs them from the directory they live in.
 fn python_source_dir(token: &str) -> String {
-    format!("/tmp/_jgl_py_{}", token)
+    format!("{}/py", private_dir(token))
 }
 
 /// The kind of value a method returns.
@@ -3093,7 +3091,7 @@ fn c_return_decl(ret_c: &str) -> String {
 /// is written once and the stubs call it. A bridge of a project with many
 /// methods is therefore as long as the methods need and not as long as the
 /// methods are.
-fn c_bridge_helpers(marker: &str, runtime: &str) -> String {
+fn c_bridge_helpers(marker: &str, runtime: &str, token: &str) -> String {
     let mut out = String::new();
     out.push_str("/* The tag of this build: the frame of the result carries it. */\n");
     out.push_str(&format!(
@@ -3105,6 +3103,28 @@ fn c_bridge_helpers(marker: &str, runtime: &str) -> String {
         "static const char jgl_runtime[] = \"{}\";\n",
         c_escape(runtime)
     ));
+    out.push_str("/* The directory the payloads of this build are written to. */\n");
+    out.push_str(&format!(
+        "static const char jgl_dir[] = \"{}\";\n",
+        c_escape(&private_dir(token))
+    ));
+    out.push_str("/* Create the directory of the payloads, or check the one that is there.\n");
+    out.push_str("   It has to be a directory of this user that no one else can write to:\n");
+    out.push_str("   a payload found in it is run, so a directory another user made is\n");
+    out.push_str("   refused rather than trusted. */\n");
+    out.push_str("static int jgl_private_dir(void) {\n");
+    out.push_str("    static int jgl_dir_ok = 0;\n");
+    out.push_str("    struct stat jgl_dst;\n");
+    out.push_str("    if (jgl_dir_ok) return 0;\n");
+    out.push_str("    if (mkdir(jgl_dir, 0700) != 0 && errno != EEXIST) return -1;\n");
+    out.push_str("    if (lstat(jgl_dir, &jgl_dst) != 0 || !S_ISDIR(jgl_dst.st_mode)\n");
+    out.push_str("        || jgl_dst.st_uid != geteuid() || (jgl_dst.st_mode & 077) != 0) {\n");
+    out.push_str("        fprintf(stderr, \"JglBridge: %s is not a private directory of this user, so it is not used\\n\", jgl_dir);\n");
+    out.push_str("        return -1;\n");
+    out.push_str("    }\n");
+    out.push_str("    jgl_dir_ok = 1;\n");
+    out.push_str("    return 0;\n");
+    out.push_str("}\n");
     out.push_str("/* Write a payload into a file and put it in its place with a rename.\n");
     out.push_str("   The file is written under a name of its own and renamed into place, so\n");
     out.push_str("   that a reader never sees half of it: two calls that run at the same\n");
@@ -3113,6 +3133,7 @@ fn c_bridge_helpers(marker: &str, runtime: &str) -> String {
     out.push_str("static int jgl_write_payload(const char *path, const unsigned char *data, uint32_t len) {\n");
     out.push_str("    char jgl_tmp[512];\n");
     out.push_str("    struct stat jgl_st;\n");
+    out.push_str("    if (jgl_private_dir() != 0) return -1;\n");
     out.push_str("    if (stat(path, &jgl_st) == 0 && jgl_st.st_size == (off_t)len) return 0;\n");
     out.push_str("    snprintf(jgl_tmp, sizeof jgl_tmp, \"%s.tmp.XXXXXX\", path);\n");
     out.push_str("    int jgl_tf = mkstemp(jgl_tmp);\n");
@@ -3767,12 +3788,12 @@ fn jvm_c_stub_source(classes: &[JvmClass], token: &str, marker: &str) -> String 
     if takes_double(classes.iter().flat_map(|c| c.methods.iter().copied())) {
         out.push_str(DOUBLE_BITS_HELPER);
     }
-    out.push_str(&c_bridge_helpers(marker, "java"));
+    out.push_str(&c_bridge_helpers(marker, "java", token));
     for c in classes {
         // The path of the jar carries the token of the build, so that two
         // projects that are built at the same time never write over each
         // other.
-        let jar_path = format!("/tmp/_jgl_jvm_{}_{}", token, c.jar_file);
+        let jar_path = format!("{}/jvm_{}", private_dir(token), c.jar_file);
         out.push_str(&format!(
             "extern const unsigned char {}_data[]; extern const uint32_t {}_len;\n",
             c.jar_symbol, c.jar_symbol
@@ -4212,17 +4233,17 @@ fn cs_c_stub_source(classes: &[(String, Vec<&FfiMethod>)], token: &str, marker: 
     );
     out.push_str("extern const unsigned char jgl_cs_bridge_dll_data[]; extern const uint32_t jgl_cs_bridge_dll_len;\n");
     out.push_str("extern const unsigned char jgl_cs_bridge_runtimeconfig_json_data[]; extern const uint32_t jgl_cs_bridge_runtimeconfig_json_len;\n\n");
-    out.push_str(&c_bridge_helpers(marker, "dotnet"));
+    out.push_str(&c_bridge_helpers(marker, "dotnet", token));
     // The bridge and its configuration belong to the build, so they are
     // written once and every call finds them.
     out.push_str("static int jgl_payload(void) {\n");
     out.push_str(&format!(
         "    if (jgl_write_payload(\"{}\", jgl_cs_bridge_dll_data, jgl_cs_bridge_dll_len) != 0) return -1;\n",
-        c_escape(&format!("/tmp/_jgl_cs_bridge_{}.dll", token))
+        c_escape(&format!("{}/cs_bridge.dll", private_dir(token)))
     ));
     out.push_str(&format!(
         "    if (jgl_write_payload(\"{}\", jgl_cs_bridge_runtimeconfig_json_data, jgl_cs_bridge_runtimeconfig_json_len) != 0) return -1;\n",
-        c_escape(&format!("/tmp/_jgl_cs_bridge_{}.runtimeconfig.json", token))
+        c_escape(&format!("{}/cs_bridge.runtimeconfig.json", private_dir(token)))
     ));
     out.push_str("    return 0;\n");
     out.push_str("}\n");
@@ -4242,10 +4263,10 @@ fn cs_c_stub_source(classes: &[(String, Vec<&FfiMethod>)], token: &str, marker: 
             // that are built at the same time never write over each other.
             // The path the stub writes the DLL to is the path the command
             // hands to the bridge.
-            let dll_path = format!("/tmp/_jgl_cs_{}_{}.dll", token, m.sym);
+            let dll_path = format!("{}/cs_{}.dll", private_dir(token), m.sym);
             // The bridge keeps the same stem, so that the runtime finds the
             // configuration of the bridge.
-            let bridge_dll = format!("/tmp/_jgl_cs_bridge_{}.dll", token);
+            let bridge_dll = format!("{}/cs_bridge.dll", private_dir(token));
             let preamble = format!(
                 "    if (jgl_payload() != 0 || jgl_write_payload(\"{dll}\", jgl_cs_dll_data, jgl_cs_dll_len) != 0) {{ {bail} }}\n{}{}",
                 cmd_arg_bufs(&args),
@@ -4304,13 +4325,14 @@ fn py_c_stub_source(methods: &[&FfiMethod], token: &str, files: &[String], marke
             sym, sym
         ));
     }
-    out.push_str(&c_bridge_helpers(marker, "python3"));
+    out.push_str(&c_bridge_helpers(marker, "python3", token));
     // The files of the project are written into the directory they live in,
     // and every file is put in its place with a rename, so that the
     // interpreter never reads half a file and two calls that run at the
     // same time cannot tear the file of the other one. The files belong to
     // the build, so they are written once and every call finds them.
     out.push_str("static int jgl_payload(void) {\n");
+    out.push_str("    if (jgl_private_dir() != 0) return -1;\n");
     out.push_str(&format!("    mkdir(\"{}\", 0700);\n", c_escape(&dir)));
     for file in files {
         let sym = payload_symbol("py", file);
@@ -4518,7 +4540,7 @@ fn lua_c_stub_source(methods: &[&FfiMethod], token: &str, marker: &str) -> Strin
     if takes_double(methods.iter().copied()) {
         out.push_str(DOUBLE_BITS_HELPER);
     }
-    out.push_str(&c_bridge_helpers(marker, "lua"));
+    out.push_str(&c_bridge_helpers(marker, "lua", token));
     for file in source_files(methods) {
         let sym = payload_symbol("lua", &file);
         out.push_str(&format!(
@@ -4658,7 +4680,7 @@ fn node_c_stub_source(lang: &str, methods: &[&FfiMethod], token: &str, marker: &
     if takes_double(methods.iter().copied()) {
         out.push_str(DOUBLE_BITS_HELPER);
     }
-    out.push_str(&c_bridge_helpers(marker, "node"));
+    out.push_str(&c_bridge_helpers(marker, "node", token));
     for file in source_files(methods) {
         let sym = payload_symbol(lang, &file);
         out.push_str(&format!(
