@@ -1,1 +1,7 @@
 target/
+.env
+*.pem
+*.key
+*.jgl_binary
+dist/
+node_modules/
