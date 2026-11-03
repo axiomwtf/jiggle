@@ -75,7 +75,6 @@ Aliases: `build` for `compile`, `check` for `validate`, `gen` for `generate`. Ev
 | Embedded as data in the binary | JavaScript, TypeScript\* (precompiled to JS at build time), JSX, TSX, Python, Lua, Ruby, PHP, Shell |
 | Embedded, needs a runtime | Java, Kotlin, Scala (JVM), C# (.NET) |
 | Static data | Markdown, AsciiDoc |
-| Special | BrightScript (Roku target only) |
 | Custom | Define your own in the manifest, see the spec |
 
 <small>\* TypeScript is precompiled to JavaScript at build time (preferred: `bun build`, fallback: `npx tsc`), then embedded as data. At runtime, `node` is used to execute the precompiled JS.</small>
